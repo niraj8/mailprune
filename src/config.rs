@@ -63,23 +63,30 @@ pub fn load() -> Result<Config> {
 
 const KEYRING_SERVICE: &str = "mailstack";
 
+/// Gmail app passwords are 16 letters; Google displays them with spaces.
+/// Strip all whitespace so pasted "xxxx xxxx xxxx xxxx" still works.
+fn clean(password: &str) -> String {
+    password.split_whitespace().collect()
+}
+
 pub fn get_password(email: &str) -> Result<String> {
     if let Ok(v) = std::env::var(format!(
         "MAILSTACK_PASSWORD_{}",
         email.replace(['@', '.', '-', '+'], "_").to_uppercase()
     )) {
-        return Ok(v);
+        return Ok(clean(&v));
     }
     let entry = keyring::Entry::new(KEYRING_SERVICE, email)?;
-    entry.get_password().with_context(|| {
+    let stored = entry.get_password().with_context(|| {
         format!(
             "no app password stored for {email}.\nrun: mailstack auth {email}\n(generate one at https://myaccount.google.com/apppasswords)"
         )
-    })
+    })?;
+    Ok(clean(&stored))
 }
 
 pub fn store_password(email: &str, password: &str) -> Result<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, email)?;
-    entry.set_password(password)?;
+    entry.set_password(&clean(password))?;
     Ok(())
 }

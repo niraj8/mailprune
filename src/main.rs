@@ -19,8 +19,37 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| prompt("email: "));
             let password =
                 rpassword::prompt_password(format!("app password for {email}: "))?;
-            config::store_password(&email, password.trim())?;
+            config::store_password(&email, &password)?;
             println!("stored in keychain (service \"mailstack\", account {email})");
+
+            // verify right away so bad credentials surface here, not in the TUI
+            let account = config::load()
+                .ok()
+                .and_then(|c| c.accounts.into_iter().find(|a| a.email == email))
+                .unwrap_or(config::AccountConfig {
+                    name: email.clone(),
+                    email: email.clone(),
+                    imap_host: "imap.gmail.com".into(),
+                    smtp_host: "smtp.gmail.com".into(),
+                });
+            print!("verifying IMAP login… ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let verified = config::get_password(&email)?;
+            match imap_client::ImapClient::connect(&account, &verified).await {
+                Ok(client) => {
+                    println!("ok ✓");
+                    client.logout().await;
+                }
+                Err(e) => {
+                    println!("FAILED\n{e:#}\n");
+                    println!("checklist:");
+                    println!("  - use an app password (https://myaccount.google.com/apppasswords), not your normal password");
+                    println!("  - 2FA must be enabled on the account to create app passwords");
+                    println!("  - the email must match the account the password was generated for");
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         Some("stacks") => return cli_stacks().await,
