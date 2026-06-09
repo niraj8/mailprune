@@ -69,6 +69,24 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app).await;
     ratatui::restore();
+
+    let s = &app.stats;
+    let cleaned = s.trashed + s.archived;
+    if cleaned + s.marked_read + s.unsubscribed > 0 {
+        println!("this session:");
+        if cleaned > 0 {
+            println!(
+                "  cleaned {cleaned} emails ({} trashed, {} archived)",
+                s.trashed, s.archived
+            );
+        }
+        if s.marked_read > 0 {
+            println!("  marked {} read", s.marked_read);
+        }
+        if s.unsubscribed > 0 {
+            println!("  unsubscribed from {} senders", s.unsubscribed);
+        }
+    }
     result
 }
 

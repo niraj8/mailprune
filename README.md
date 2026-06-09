@@ -1,6 +1,6 @@
 # mailprune
 
-Chuck-style email triage TUI. Stacks your inbox by sender so you can trash, archive,
+Email triage TUI. Stacks your inbox by sender so you can trash, archive,
 mark-read, or **unsubscribe** from hundreds of emails in a few keystrokes. Built for
 fast inbox-zero over Gmail IMAP, multi-account.
 

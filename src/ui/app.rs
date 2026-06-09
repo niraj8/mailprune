@@ -92,6 +92,15 @@ impl AccountView {
     }
 }
 
+#[derive(Default)]
+pub struct SessionStats {
+    pub trashed: usize,
+    pub archived: usize,
+    pub marked_read: usize,
+    /// senders successfully unsubscribed from
+    pub unsubscribed: usize,
+}
+
 pub struct App {
     pub accounts: Vec<AccountView>,
     pub active: usize,
@@ -102,6 +111,7 @@ pub struct App {
     pub status: String,
     pub busy: bool,
     pub should_quit: bool,
+    pub stats: SessionStats,
 }
 
 impl App {
@@ -116,6 +126,7 @@ impl App {
             status: String::from("loading…"),
             busy: false,
             should_quit: false,
+            stats: SessionStats::default(),
         }
     }
 
@@ -445,6 +456,7 @@ impl App {
         let acct = self.account_mut();
         acct.client.as_mut().unwrap().trash(&uids).await?;
         self.remove_stacks(stack_idxs);
+        self.stats.trashed += uids.len();
         self.status = format!("trashed {} messages from {label}", uids.len());
         Ok(())
     }
@@ -454,6 +466,7 @@ impl App {
         let acct = self.account_mut();
         acct.client.as_mut().unwrap().archive(&uids).await?;
         self.remove_stacks(stack_idxs);
+        self.stats.archived += uids.len();
         self.status = format!("archived {} messages from {label}", uids.len());
         Ok(())
     }
@@ -473,6 +486,7 @@ impl App {
                     acct.stacks[i].unread_count = 0;
                 }
                 acct.marked.clear();
+                self.stats.marked_read += uids.len();
                 self.status = format!("marked {} messages read ({label})", uids.len());
             }
             Err(e) => {
@@ -517,6 +531,7 @@ impl App {
         } else {
             format!("unsubscribed {ok}/{} stacks (last: {last})", ok + failed)
         };
+        self.stats.unsubscribed += ok;
         (ok, failed)
     }
 
