@@ -53,9 +53,10 @@ fn draw_stack_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible_stacks();
     let title = if app.filter.is_empty() {
         format!(
-            " stacks ({}) · {} msgs ",
+            " stacks ({}) · {} msgs · by {} ",
             visible.len(),
-            acct.total_messages()
+            acct.total_messages(),
+            app.group_by.label()
         )
     } else {
         format!(" stacks ({}) · filter: {} ", visible.len(), app.filter)
@@ -76,14 +77,21 @@ fn draw_stack_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(count, Style::default().fg(Color::Yellow)),
                 Span::raw(" "),
                 Span::styled(badge, Style::default().fg(Color::Green).bold()),
                 Span::raw(" "),
-                Span::styled(truncate(&s.display_name, 30), name_style),
-                Span::styled(unread, Style::default().fg(Color::Cyan)),
-            ]))
+                Span::styled(truncate(&s.display_name, 24), name_style),
+            ];
+            if let Some(subject) = &s.subject {
+                spans.push(Span::styled(
+                    format!(" · {}", truncate(subject, 32)),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            spans.push(Span::styled(unread, Style::default().fg(Color::Cyan)));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let highlight = if acct.expanded {
@@ -185,7 +193,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let help = if app.account().expanded {
         " j/k move · Esc collapse · d trash · e archive · r read · u unsub · q quit"
     } else {
-        " j/k move · Enter expand · d trash · e archive · r read · u unsub · / filter · Tab account · R refresh · q quit"
+        " j/k move · Enter expand · d trash · e archive · r read · u unsub · s group · / filter · Tab account · R refresh · q quit"
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),

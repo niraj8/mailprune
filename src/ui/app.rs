@@ -3,7 +3,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::AccountConfig;
 use crate::imap_client::ImapClient;
-use crate::stacks::{build_stacks, Stack};
+use crate::stacks::{build_stacks, GroupBy, Stack};
 use crate::unsubscribe::{self, Method};
 
 pub enum Mode {
@@ -83,6 +83,7 @@ pub struct App {
     pub accounts: Vec<AccountView>,
     pub active: usize,
     pub mode: Mode,
+    pub group_by: GroupBy,
     pub filter: String,
     pub status: String,
     pub busy: bool,
@@ -95,6 +96,7 @@ impl App {
             accounts: accounts.into_iter().map(AccountView::new).collect(),
             active: 0,
             mode: Mode::Normal,
+            group_by: GroupBy::Sender,
             filter: String::new(),
             status: String::from("loading…"),
             busy: false,
@@ -121,7 +123,11 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, s)| {
-                s.key.contains(&needle) || s.display_name.to_lowercase().contains(&needle)
+                s.key.contains(&needle)
+                    || s.display_name.to_lowercase().contains(&needle)
+                    || s.subject
+                        .as_deref()
+                        .is_some_and(|sub| sub.to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
             .collect()
@@ -146,9 +152,11 @@ impl App {
             acct.client = Some(client);
         }
         self.status = format!("fetching inbox for {}…", acct.cfg.email);
+        let group_by = self.group_by;
+        let acct = &mut self.accounts[active];
         let msgs = acct.client.as_mut().unwrap().fetch_inbox().await?;
         let n = msgs.len();
-        acct.stacks = build_stacks(msgs);
+        acct.stacks = build_stacks(msgs, group_by);
         acct.selected = acct.selected.min(acct.stacks.len().saturating_sub(1));
         acct.expanded = false;
         acct.msg_selected = 0;
@@ -208,6 +216,26 @@ impl App {
                 }
             }
             (KeyCode::Char('R'), _) => self.run_load().await,
+            (KeyCode::Char('s'), _) => {
+                self.group_by = self.group_by.toggle();
+                let group_by = self.group_by;
+                // regroup every loaded account from its already-fetched messages
+                for acct in &mut self.accounts {
+                    if !acct.loaded {
+                        continue;
+                    }
+                    let msgs = acct
+                        .stacks
+                        .drain(..)
+                        .flat_map(|s| s.msgs)
+                        .collect::<Vec<_>>();
+                    acct.stacks = build_stacks(msgs, group_by);
+                    acct.selected = 0;
+                    acct.expanded = false;
+                    acct.msg_selected = 0;
+                }
+                self.status = format!("grouping by {}", group_by.label());
+            }
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::Filter;
                 self.filter.clear();

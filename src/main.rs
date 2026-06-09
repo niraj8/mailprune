@@ -103,7 +103,7 @@ async fn cli_stacks() -> Result<()> {
         let mut client = imap_client::ImapClient::connect(account, &password).await?;
         let msgs = client.fetch_inbox().await?;
         let total = msgs.len();
-        let stacks = stacks::build_stacks(msgs);
+        let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender);
         println!("{total} messages, {} stacks\n", stacks.len());
         for s in &stacks {
             println!(
