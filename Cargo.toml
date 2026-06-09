@@ -2,6 +2,9 @@
 name = "mailprune"
 version = "0.1.0"
 edition = "2024"
+description = "Email triage TUI — stack your inbox by sender, bulk trash/archive/unsubscribe"
+license = "MIT"
+repository = "https://github.com/niraj8/mailprune"
 
 [dependencies]
 anyhow = "1.0.102"

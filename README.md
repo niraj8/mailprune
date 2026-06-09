@@ -18,6 +18,12 @@ fast inbox-zero over Gmail IMAP, multi-account.
 ## Install
 
 ```sh
+brew install niraj8/tap/mailprune
+```
+
+or from source:
+
+```sh
 make install   # cargo build --release && cp to ~/bin
 ```
 
