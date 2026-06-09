@@ -51,6 +51,10 @@ fast inbox-zero over Gmail IMAP, multi-account.
 | `e` | archive stack (moves to All Mail) |
 | `r` | mark stack read |
 | `u` | unsubscribe — RFC 8058 one-click POST → mailto via SMTP → browser fallback; then offers to trash the stack |
+| `Space` | mark stack for bulk action (auto-advances; `d`/`e`/`r`/`u` then apply to all marked) |
+| `a` | mark all visible stacks (again to clear) |
+| `s` | toggle grouping: sender ↔ sender+subject |
+| `o` | toggle sort: count ↔ read rate (least-read first — your dead newsletters) |
 | `/` | filter stacks by sender |
 | `Tab` | next account |
 | `R` | refresh |
@@ -59,6 +63,7 @@ fast inbox-zero over Gmail IMAP, multi-account.
 
 ## Notes
 
+- Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
 - Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.
 - Passwords live in the Keychain under service `mailstack`. Env override: `MAILSTACK_PASSWORD_<EMAIL_WITH_UNDERSCORES>`.

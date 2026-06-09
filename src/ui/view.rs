@@ -51,38 +51,63 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_stack_list(frame: &mut Frame, app: &App, area: Rect) {
     let acct = app.account();
     let visible = app.visible_stacks();
+    let marked = if acct.marked.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} marked", acct.marked.len())
+    };
     let title = if app.filter.is_empty() {
         format!(
-            " stacks ({}) · {} msgs · by {} ",
+            " stacks ({}) · {} msgs · by {} · sort {}{} ",
             visible.len(),
             acct.total_messages(),
-            app.group_by.label()
+            app.group_by.label(),
+            app.sort_by.label(),
+            marked
         )
     } else {
-        format!(" stacks ({}) · filter: {} ", visible.len(), app.filter)
+        format!(
+            " stacks ({}) · filter: {}{} ",
+            visible.len(),
+            app.filter,
+            marked
+        )
     };
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
             let s = &acct.stacks[i];
+            let is_marked = acct.marked.contains(&s.key);
+            let mark = if is_marked { "▌" } else { " " };
             let count = format!("{:>4}", s.msgs.len());
             let badge = if s.can_unsubscribe { "U" } else { " " };
+            let rate = s.read_rate();
+            let rate_style = match rate {
+                0..=10 => Style::default().fg(Color::Red),
+                11..=40 => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            };
             let unread = if s.unread_count > 0 {
                 format!(" ({} new)", s.unread_count)
             } else {
                 String::new()
             };
-            let name_style = if s.unread_count > 0 {
+            let name_style = if is_marked {
+                Style::default().fg(Color::Cyan).bold()
+            } else if s.unread_count > 0 {
                 Style::default().bold()
             } else {
                 Style::default()
             };
             let mut spans = vec![
+                Span::styled(mark, Style::default().fg(Color::Cyan).bold()),
                 Span::styled(count, Style::default().fg(Color::Yellow)),
+                Span::raw(" "),
+                Span::styled(format!("{rate:>3}%"), rate_style),
                 Span::raw(" "),
                 Span::styled(badge, Style::default().fg(Color::Green).bold()),
                 Span::raw(" "),
-                Span::styled(truncate(&s.display_name, 24), name_style),
+                Span::styled(truncate(&s.display_name, 22), name_style),
             ];
             if let Some(subject) = &s.subject {
                 spans.push(Span::styled(
@@ -193,7 +218,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let help = if app.account().expanded {
         " j/k move · Esc collapse · d trash · e archive · r read · u unsub · q quit"
     } else {
-        " j/k move · Enter expand · d trash · e archive · r read · u unsub · s group · / filter · Tab account · R refresh · q quit"
+        " j/k · Enter expand · Space mark · a mark all · d trash · e archive · r read · u unsub · s group · o sort · / filter · Tab acct · R refresh · q quit"
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
