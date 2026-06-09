@@ -17,15 +17,21 @@ fast inbox-zero over Gmail IMAP, multi-account.
 
 ## Install
 
+macOS and Linux (prebuilt binaries via Homebrew):
+
 ```sh
 brew install niraj8/tap/mailprune
 ```
 
-or from source:
+Or grab a tarball from [releases](https://github.com/niraj8/mailprune/releases) (macOS arm64/x86_64, Linux x86_64), or build from source:
 
 ```sh
 make install   # cargo build --release && cp to ~/bin
 ```
+
+Passwords are stored in the platform keychain: macOS Keychain, Secret Service
+(GNOME Keyring/KWallet) on Linux, Credential Manager on Windows (compiles, untested).
+No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var instead.
 
 ## Setup
 
