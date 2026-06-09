@@ -1,11 +1,11 @@
-# mailstack
+# mailprune
 
 Chuck-style email triage TUI. Stacks your inbox by sender so you can trash, archive,
 mark-read, or **unsubscribe** from hundreds of emails in a few keystrokes. Built for
 fast inbox-zero over Gmail IMAP, multi-account.
 
 ```
- mailstack  personal  work
+ mailprune  personal  work
 ┌ stacks (42) · 873 msgs · by sender · sort read rate · 2 marked ─┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
 │▌ 214   0% U DoorDash (12 new)                                   ││ 2026-06-09 ● Your order is on the way                     │
 │▌ 120   2% U Medium Daily Digest                                 ││ 2026-06-08   Craving something new?                       │
@@ -27,7 +27,7 @@ make install   # cargo build --release && cp to ~/bin
    <https://myaccount.google.com/apppasswords> (also requires IMAP enabled in
    Gmail Settings → Forwarding and POP/IMAP).
 
-2. **Config** — create `~/.config/mailstack/config.toml`:
+2. **Config** — create `~/.config/mailprune/config.toml`:
 
    ```toml
    [[accounts]]
@@ -42,10 +42,10 @@ make install   # cargo build --release && cp to ~/bin
 3. **Store app passwords** (saved in the macOS Keychain):
 
    ```sh
-   mailstack auth you@gmail.com
+   mailprune auth you@gmail.com
    ```
 
-4. **Run**: `mailstack` (TUI) or `mailstack stacks` (headless dump of all accounts).
+4. **Run**: `mailprune` (TUI) or `mailprune stacks` (headless dump of all accounts).
 
 ## Keys
 
@@ -83,4 +83,4 @@ The fastest way to inbox zero:
 - Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
 - Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.
-- Passwords live in the Keychain under service `mailstack`. Env override: `MAILSTACK_PASSWORD_<EMAIL_WITH_UNDERSCORES>`.
+- Passwords live in the Keychain under service `mailprune`. Env override: `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>`.

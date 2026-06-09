@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
             let password =
                 rpassword::prompt_password(format!("app password for {email}: "))?;
             config::store_password(&email, &password)?;
-            println!("stored in keychain (service \"mailstack\", account {email})");
+            println!("stored in keychain (service \"mailprune\", account {email})");
 
             // verify right away so bad credentials surface here, not in the TUI
             let account = config::load()
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         Some("stacks") => return cli_stacks().await,
         Some("help") | Some("--help") | Some("-h") => {
             println!(
-                "mailstack — email triage TUI\n\n  mailstack            run the TUI\n  mailstack auth <em>  store a Gmail app password in the keychain\n  mailstack stacks     print stacks to stdout (no TUI)\n\nconfig: ~/.config/mailstack/config.toml\n{}",
+                "mailprune — email triage TUI\n\n  mailprune            run the TUI\n  mailprune auth <em>  store a Gmail app password in the keychain\n  mailprune stacks     print stacks to stdout (no TUI)\n\nconfig: ~/.config/mailprune/config.toml\n{}",
                 config::SAMPLE_CONFIG
             );
             return Ok(());

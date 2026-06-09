@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = vec![Span::styled(
-        " mailstack ",
+        " mailprune ",
         Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
     )];
     for (i, acct) in app.accounts.iter().enumerate() {

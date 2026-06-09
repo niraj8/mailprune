@@ -66,7 +66,7 @@ pub async fn execute(
     match method {
         Method::OneClick(url) => {
             let client = reqwest::Client::builder()
-                .user_agent("mailstack/0.1")
+                .user_agent("mailprune/0.1")
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?;
             let resp = client

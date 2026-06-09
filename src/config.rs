@@ -28,10 +28,10 @@ pub struct Config {
 
 pub fn config_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".config/mailstack/config.toml"))
+    Ok(home.join(".config/mailprune/config.toml"))
 }
 
-pub const SAMPLE_CONFIG: &str = r#"# mailstack config
+pub const SAMPLE_CONFIG: &str = r#"# mailprune config
 [[accounts]]
 name = "personal"
 email = "you@gmail.com"
@@ -61,7 +61,7 @@ pub fn load() -> Result<Config> {
     Ok(cfg)
 }
 
-const KEYRING_SERVICE: &str = "mailstack";
+const KEYRING_SERVICE: &str = "mailprune";
 
 /// Gmail app passwords are 16 letters; Google displays them with spaces.
 /// Strip all whitespace so pasted "xxxx xxxx xxxx xxxx" still works.
@@ -71,18 +71,27 @@ fn clean(password: &str) -> String {
 
 pub fn get_password(email: &str) -> Result<String> {
     if let Ok(v) = std::env::var(format!(
-        "MAILSTACK_PASSWORD_{}",
+        "MAILPRUNE_PASSWORD_{}",
         email.replace(['@', '.', '-', '+'], "_").to_uppercase()
     )) {
         return Ok(clean(&v));
     }
     let entry = keyring::Entry::new(KEYRING_SERVICE, email)?;
-    let stored = entry.get_password().with_context(|| {
+    if let Ok(stored) = entry.get_password() {
+        return Ok(clean(&stored));
+    }
+    // migrate entries stored under the pre-rename service name
+    let old = keyring::Entry::new("mailstack", email)?;
+    let stored = old.get_password().with_context(|| {
         format!(
-            "no app password stored for {email}.\nrun: mailstack auth {email}\n(generate one at https://myaccount.google.com/apppasswords)"
+            "no app password stored for {email}.\nrun: mailprune auth {email}\n(generate one at https://myaccount.google.com/apppasswords)"
         )
     })?;
-    Ok(clean(&stored))
+    let stored = clean(&stored);
+    if entry.set_password(&stored).is_ok() {
+        let _ = old.delete_credential();
+    }
+    Ok(stored)
 }
 
 pub fn store_password(email: &str, password: &str) -> Result<()> {

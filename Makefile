@@ -1,4 +1,4 @@
-BIN := mailstack
+BIN := mailprune
 PREFIX := $(HOME)/bin
 
 .PHONY: install build test clean
