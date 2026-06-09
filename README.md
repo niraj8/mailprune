@@ -6,13 +6,19 @@ fast inbox-zero over Gmail IMAP, multi-account.
 
 ```
  mailstack  personal  work
-┌ stacks (42) · 873 msgs ──────────┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
-│  214 U DoorDash (12 new)         ││ 2026-06-09 ● Your order is on the way                     │
-│  120 U Medium Daily Digest       ││ 2026-06-08   Craving something new?                       │
-│   76 U LinkedIn                  ││ 2026-06-07   Weekend deals near you                       │
-│   31   GitHub                    ││ ...                                                       │
-└──────────────────────────────────┘└───────────────────────────────────────────────────────────┘
- j/k move · Enter expand · d trash · e archive · r read · u unsub · / filter · Tab account · R refresh · q quit
+┌ stacks (42) · 873 msgs · by sender · sort read rate · 2 marked ─┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
+│▌ 214   0% U DoorDash (12 new)                                   ││ 2026-06-09 ● Your order is on the way                     │
+│▌ 120   2% U Medium Daily Digest                                 ││ 2026-06-08   Craving something new?                       │
+│   76  31% U LinkedIn                                            ││ 2026-06-07   Weekend deals near you                       │
+│   31  94%   GitHub                                              ││ ...                                                       │
+└─────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
+ j/k · Enter expand · Space mark · a mark all · d trash · e archive · r read · u unsub · s group · o sort · / filter · Tab acct · q quit
+```
+
+## Install
+
+```sh
+make install   # cargo build --release && cp to ~/bin
 ```
 
 ## Setup
@@ -60,6 +66,17 @@ fast inbox-zero over Gmail IMAP, multi-account.
 | `R` | refresh |
 | `g` / `G` | top / bottom |
 | `q` | quit |
+
+## The kill-loop
+
+The fastest way to inbox zero:
+
+1. `o` — sort by read rate. Stacks you never open float to the top.
+2. `Space` down the list to mark the dead newsletters (auto-advances).
+3. `u` — bulk unsubscribe everything marked, one confirm.
+4. `y` again at the "also trash?" prompt.
+5. `s` to regroup by sender+subject and repeat for noisy notification types
+   from senders you otherwise keep.
 
 ## Notes
 
