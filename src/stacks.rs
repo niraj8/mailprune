@@ -224,7 +224,10 @@ mod tests {
     #[test]
     fn subject_normalization() {
         assert_eq!(normalize_subject("Re: Re: Hello"), "hello");
-        assert_eq!(normalize_subject("Fwd: order #123 shipped"), "order ## shipped");
+        assert_eq!(
+            normalize_subject("Fwd: order #123 shipped"),
+            "order ## shipped"
+        );
         assert_eq!(
             normalize_subject("Order #456 shipped"),
             normalize_subject("ORDER #99 shipped")

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -52,9 +52,10 @@ pub fn load() -> Result<Config> {
             SAMPLE_CONFIG
         );
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     if cfg.accounts.is_empty() {
         bail!("config has no [[accounts]] entries");
     }

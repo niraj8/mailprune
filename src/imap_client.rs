@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -145,17 +145,11 @@ fn parse_from(raw: &str) -> (String, String) {
         for addr in list.iter() {
             match addr {
                 mailparse::MailAddr::Single(s) => {
-                    return (
-                        s.display_name.clone().unwrap_or_default(),
-                        s.addr.clone(),
-                    )
+                    return (s.display_name.clone().unwrap_or_default(), s.addr.clone());
                 }
                 mailparse::MailAddr::Group(g) => {
                     if let Some(s) = g.addrs.first() {
-                        return (
-                            s.display_name.clone().unwrap_or_default(),
-                            s.addr.clone(),
-                        );
+                        return (s.display_name.clone().unwrap_or_default(), s.addr.clone());
                     }
                 }
             }

@@ -1,9 +1,9 @@
 use chrono::{DateTime, Local, Utc};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 use super::app::{App, Mode};
 
@@ -151,15 +151,17 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .and_then(crate::unsubscribe::pick_method)
         .map(|m| format!(" · unsub: {}", m.describe()))
         .unwrap_or_default();
-    let title = format!(" {} <{}>{} ", truncate(&stack.display_name, 28), stack.key, unsub);
+    let title = format!(
+        " {} <{}>{} ",
+        truncate(&stack.display_name, 28),
+        stack.key,
+        unsub
+    );
     let items: Vec<ListItem> = stack
         .msgs
         .iter()
         .map(|m| {
-            let date = m
-                .date
-                .map(fmt_date)
-                .unwrap_or_else(|| "          ".into());
+            let date = m.date.map(fmt_date).unwrap_or_else(|| "          ".into());
             let dot = if m.unread { "●" } else { " " };
             let style = if m.unread {
                 Style::default().bold()

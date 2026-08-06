@@ -17,8 +17,7 @@ async fn main() -> Result<()> {
                 .get(2)
                 .map(String::to_owned)
                 .unwrap_or_else(|| prompt("email: "));
-            let password =
-                rpassword::prompt_password(format!("app password for {email}: "))?;
+            let password = rpassword::prompt_password(format!("app password for {email}: "))?;
             config::store_password(&email, &password)?;
             println!("stored in keychain (service \"mailprune\", account {email})");
 
@@ -44,7 +43,9 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     println!("FAILED\n{e:#}\n");
                     println!("checklist:");
-                    println!("  - use an app password (https://myaccount.google.com/apppasswords), not your normal password");
+                    println!(
+                        "  - use an app password (https://myaccount.google.com/apppasswords), not your normal password"
+                    );
                     println!("  - 2FA must be enabled on the account to create app passwords");
                     println!("  - the email must match the account the password was generated for");
                     std::process::exit(1);
@@ -121,8 +122,7 @@ async fn cli_stacks() -> Result<()> {
         let mut client = imap_client::ImapClient::connect(account, &password).await?;
         let msgs = client.fetch_inbox().await?;
         let total = msgs.len();
-        let stacks =
-            stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
+        let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
         println!("{total} messages, {} stacks\n", stacks.len());
         for s in &stacks {
             println!(

@@ -3,7 +3,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::AccountConfig;
 use crate::imap_client::ImapClient;
-use crate::stacks::{build_stacks, sort_stacks, GroupBy, SortBy, Stack};
+use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
 use std::collections::HashSet;
 
@@ -16,11 +16,19 @@ pub enum Mode {
 
 #[derive(Debug, Clone)]
 pub enum PendingAction {
-    Trash { stack_idxs: Vec<usize> },
-    Archive { stack_idxs: Vec<usize> },
-    Unsubscribe { stack_idxs: Vec<usize> },
+    Trash {
+        stack_idxs: Vec<usize>,
+    },
+    Archive {
+        stack_idxs: Vec<usize>,
+    },
+    Unsubscribe {
+        stack_idxs: Vec<usize>,
+    },
     /// after a successful unsubscribe, offer to trash the stacks too
-    TrashAfterUnsub { stack_idxs: Vec<usize> },
+    TrashAfterUnsub {
+        stack_idxs: Vec<usize>,
+    },
 }
 
 impl PendingAction {
@@ -188,8 +196,7 @@ impl App {
         }
         if acct.client.is_none() {
             self.status = format!("connecting to {}…", acct.cfg.email);
-            let client =
-                ImapClient::connect(&acct.cfg, acct.password.as_deref().unwrap()).await?;
+            let client = ImapClient::connect(&acct.cfg, acct.password.as_deref().unwrap()).await?;
             acct.client = Some(client);
         }
         self.status = format!("fetching inbox for {}…", acct.cfg.email);
@@ -329,13 +336,17 @@ impl App {
             (KeyCode::Char('d'), _) => {
                 let targets = self.target_stacks();
                 if !targets.is_empty() {
-                    self.mode = Mode::Confirm(PendingAction::Trash { stack_idxs: targets });
+                    self.mode = Mode::Confirm(PendingAction::Trash {
+                        stack_idxs: targets,
+                    });
                 }
             }
             (KeyCode::Char('e'), _) => {
                 let targets = self.target_stacks();
                 if !targets.is_empty() {
-                    self.mode = Mode::Confirm(PendingAction::Archive { stack_idxs: targets });
+                    self.mode = Mode::Confirm(PendingAction::Archive {
+                        stack_idxs: targets,
+                    });
                 }
             }
             (KeyCode::Char('r'), _) => {
@@ -358,7 +369,9 @@ impl App {
                 if targets.is_empty() {
                     self.status = "no List-Unsubscribe header in selection".into();
                 } else {
-                    self.mode = Mode::Confirm(PendingAction::Unsubscribe { stack_idxs: targets });
+                    self.mode = Mode::Confirm(PendingAction::Unsubscribe {
+                        stack_idxs: targets,
+                    });
                 }
             }
             _ => {}

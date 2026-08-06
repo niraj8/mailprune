@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::config::AccountConfig;
@@ -30,7 +30,11 @@ pub fn pick_method(msg: &MsgMeta) -> Option<Method> {
     let mut https_url: Option<String> = None;
     let mut mailto: Option<Method> = None;
     for part in header.split(',') {
-        let uri = part.trim().trim_start_matches('<').trim_end_matches('>').trim();
+        let uri = part
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
         if uri.starts_with("https://") || uri.starts_with("http://") {
             https_url.get_or_insert_with(|| uri.to_string());
         } else if let Some(rest) = uri.strip_prefix("mailto:") {
@@ -58,11 +62,7 @@ pub fn pick_method(msg: &MsgMeta) -> Option<Method> {
     mailto.or(https_url.map(Method::Browser))
 }
 
-pub async fn execute(
-    method: &Method,
-    account: &AccountConfig,
-    password: &str,
-) -> Result<String> {
+pub async fn execute(method: &Method, account: &AccountConfig, password: &str) -> Result<String> {
     match method {
         Method::OneClick(url) => {
             let client = reqwest::Client::builder()
@@ -86,7 +86,9 @@ pub async fn execute(
         Method::Mailto { to, subject } => {
             let email = Message::builder()
                 .from(account.email.parse()?)
-                .to(to.parse().with_context(|| format!("bad mailto address {to}"))?)
+                .to(to
+                    .parse()
+                    .with_context(|| format!("bad mailto address {to}"))?)
                 .subject(subject.clone())
                 .body(String::from("unsubscribe"))?;
             let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&account.smtp_host)?
@@ -95,7 +97,10 @@ pub async fn execute(
                     password.to_string(),
                 ))
                 .build();
-            mailer.send(email).await.context("sending unsubscribe email")?;
+            mailer
+                .send(email)
+                .await
+                .context("sending unsubscribe email")?;
             Ok(format!("unsubscribe email sent to {to}"))
         }
         Method::Browser(url) => {
