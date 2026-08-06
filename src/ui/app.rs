@@ -113,11 +113,21 @@ pub struct AccountView {
     pub loaded: bool,
     /// stack keys marked for bulk actions
     pub marked: HashSet<String>,
-    /// stacks that were actually rendered on screen this session, with
-    /// features frozen at first sighting — survives refresh and regrouping
-    pub seen: HashMap<String, StackSnapshot>,
-    /// stack keys acted on this session (excluded from "keep" at quit)
-    pub acted: HashSet<String>,
+    /// stacks rendered on screen under the *current* grouping, keyed by stack
+    /// key, features frozen at first sighting. Cleared when the grouping
+    /// changes: a stack is a different object under a different grouping, and
+    /// keeping both would emit two "keep" rows for the same messages.
+    pub seen: HashMap<String, SeenStack>,
+    /// uids acted on this session, excluded from "keep" at quit. Keyed by uid
+    /// rather than stack key so the exclusion survives regrouping.
+    pub acted: HashSet<u32>,
+}
+
+/// a stack as it was when first rendered
+pub struct SeenStack {
+    pub snap: StackSnapshot,
+    /// the messages it was made of, for testing against `acted`
+    pub uids: Vec<u32>,
 }
 
 impl AccountView {
@@ -241,10 +251,13 @@ impl App {
     pub fn record_seen(&mut self, stack_idxs: &[usize]) {
         let acct = self.account_mut();
         for &i in stack_idxs {
-            let key = &acct.stacks[i].key;
-            if !acct.seen.contains_key(key) {
-                acct.seen
-                    .insert(key.clone(), StackSnapshot::of(&acct.stacks[i]));
+            let stack = &acct.stacks[i];
+            if !acct.seen.contains_key(&stack.key) {
+                let seen = SeenStack {
+                    snap: StackSnapshot::of(stack),
+                    uids: stack.uids(),
+                };
+                acct.seen.insert(stack.key.clone(), seen);
             }
         }
     }
@@ -257,19 +270,47 @@ impl App {
             .map(|&i| StackSnapshot::of(&acct.stacks[i]))
             .collect();
         for &i in stack_idxs {
-            acct.acted.insert(acct.stacks[i].key.clone());
+            acct.acted.extend(acct.stacks[i].uids());
         }
         self.log.log(&acct.cfg.email, action, &snaps);
     }
 
-    /// at session end, stacks seen on screen but never acted on are "keep"
+    /// rebuild every loaded account's stacks from its already-fetched messages
+    fn regroup(&mut self, group_by: GroupBy) {
+        self.group_by = group_by;
+        let sort_by = self.sort_by;
+        for acct in &mut self.accounts {
+            if !acct.loaded {
+                continue;
+            }
+            let msgs = acct
+                .stacks
+                .drain(..)
+                .flat_map(|s| s.msgs)
+                .collect::<Vec<_>>();
+            acct.stacks = build_stacks(msgs, group_by, sort_by);
+            acct.selected = 0;
+            acct.expanded = false;
+            acct.msg_selected = 0;
+            acct.marked.clear();
+            // snapshots describe stacks that no longer exist; keeping them
+            // would log these messages as "keep" twice, once per grouping.
+            // `acted` is uid-keyed and survives.
+            acct.seen.clear();
+        }
+        self.status = format!("grouping by {}", group_by.label());
+    }
+
+    /// at session end, stacks seen on screen but never acted on are "keep".
+    /// A stack containing any acted-on message is not a keep — the user
+    /// already made a decision about it, possibly under another grouping.
     pub fn flush_keeps(&mut self) {
         for acct in &self.accounts {
             let mut keeps: Vec<StackSnapshot> = acct
                 .seen
-                .iter()
-                .filter(|(key, _)| !acct.acted.contains(*key))
-                .map(|(_, snap)| snap.clone())
+                .values()
+                .filter(|seen| !seen.uids.iter().any(|uid| acct.acted.contains(uid)))
+                .map(|seen| seen.snap.clone())
                 .collect();
             keeps.sort_by(|a, b| (&a.sender, &a.subject).cmp(&(&b.sender, &b.subject)));
             self.log.log(&acct.cfg.email, Action::Keep, &keeps);
@@ -415,28 +456,7 @@ impl App {
                 }
             }
             (KeyCode::Char('R'), _) => self.run_load().await,
-            (KeyCode::Char('s'), _) => {
-                self.group_by = self.group_by.toggle();
-                let group_by = self.group_by;
-                let sort_by = self.sort_by;
-                // regroup every loaded account from its already-fetched messages
-                for acct in &mut self.accounts {
-                    if !acct.loaded {
-                        continue;
-                    }
-                    let msgs = acct
-                        .stacks
-                        .drain(..)
-                        .flat_map(|s| s.msgs)
-                        .collect::<Vec<_>>();
-                    acct.stacks = build_stacks(msgs, group_by, sort_by);
-                    acct.selected = 0;
-                    acct.expanded = false;
-                    acct.msg_selected = 0;
-                    acct.marked.clear();
-                }
-                self.status = format!("grouping by {}", group_by.label());
-            }
+            (KeyCode::Char('s'), _) => self.regroup(self.group_by.toggle()),
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::Filter;
                 self.filter.clear();
@@ -765,17 +785,28 @@ mod tests {
     use super::*;
     use crate::stacks::MsgMeta;
 
-    fn msg(sender: &str) -> MsgMeta {
+    fn msg(uid: u32, sender: &str, subject: &str) -> MsgMeta {
         MsgMeta {
-            uid: 1,
+            uid,
             sender_email: sender.into(),
             sender_name: String::new(),
-            subject: "hi".into(),
+            subject: subject.into(),
             date: None,
             unread: true,
             list_unsubscribe: None,
             one_click: false,
         }
+    }
+
+    /// two senders, two subjects each — so regrouping actually changes the
+    /// stack set rather than being a no-op
+    fn test_msgs() -> Vec<MsgMeta> {
+        vec![
+            msg(1, "a@x.com", "one"),
+            msg(2, "a@x.com", "two"),
+            msg(3, "b@x.com", "one"),
+            msg(4, "b@x.com", "two"),
+        ]
     }
 
     fn test_app(log: ActionLog) -> App {
@@ -786,36 +817,46 @@ mod tests {
             smtp_host: "smtp".into(),
         };
         let mut app = App::new(vec![cfg], log);
-        app.accounts[0].stacks = build_stacks(
-            vec![msg("a@x.com"), msg("b@x.com")],
-            GroupBy::Sender,
-            SortBy::Count,
-        );
+        app.accounts[0].stacks = build_stacks(test_msgs(), GroupBy::Sender, SortBy::Count);
+        app.accounts[0].loaded = true;
         app
+    }
+
+    fn read_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(path).unwrap();
+        raw.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// each test writes to its own file; the process id alone collides
+    /// when tests run in parallel
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("mailprune-app-{name}-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn stack_idx(app: &App, key: &str) -> usize {
+        app.accounts[0]
+            .stacks
+            .iter()
+            .position(|s| s.key == key)
+            .unwrap()
     }
 
     #[test]
     fn keeps_are_seen_minus_acted() {
-        let path =
-            std::env::temp_dir().join(format!("mailprune-app-test-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_log("keeps");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.record_seen(&[0, 1]);
         // re-sighting must not overwrite the first snapshot
         app.record_seen(&[0]);
-        let a_idx = app.accounts[0]
-            .stacks
-            .iter()
-            .position(|s| s.key == "a@x.com")
-            .unwrap();
-        app.log_action(Action::Trash, &[a_idx]);
+        app.log_action(Action::Trash, &[stack_idx(&app, "a@x.com")]);
         app.flush_keeps();
 
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let recs: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let recs = read_records(&path);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0]["action"], "trash");
         assert_eq!(recs[0]["sender"], "a@x.com");
@@ -824,13 +865,54 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// regrouping rebuilds the stacks under new keys. Without clearing
+    /// `seen`, the same messages are logged as "keep" once per grouping.
+    #[test]
+    fn regrouping_does_not_double_log_keeps() {
+        let path = temp_log("regroup");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.record_seen(&[0, 1]);
+
+        app.regroup(GroupBy::SenderSubject);
+        let all: Vec<usize> = (0..app.account().stacks.len()).collect();
+        assert_eq!(all.len(), 4, "one stack per sender+subject pair");
+        app.record_seen(&all);
+        app.flush_keeps();
+
+        let recs = read_records(&path);
+        assert!(recs.iter().all(|r| r["action"] == "keep"));
+        assert_eq!(recs.len(), 4, "only the current grouping is reported");
+        assert!(recs.iter().all(|r| r["group_by"] == "sender+subject"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `acted` is uid-keyed, so a decision made under one grouping still
+    /// suppresses the "keep" for those messages under another.
+    #[test]
+    fn acting_then_regrouping_does_not_relabel_as_keep() {
+        let path = temp_log("acted-regroup");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.record_seen(&[0, 1]);
+        // marking read leaves the stack in place, unlike trash/archive
+        app.log_action(Action::Read, &[stack_idx(&app, "a@x.com")]);
+
+        app.regroup(GroupBy::SenderSubject);
+        let all: Vec<usize> = (0..app.account().stacks.len()).collect();
+        app.record_seen(&all);
+        app.flush_keeps();
+
+        let recs = read_records(&path);
+        assert_eq!(recs[0]["action"], "read");
+        let keeps: Vec<&serde_json::Value> =
+            recs.iter().filter(|r| r["action"] == "keep").collect();
+        assert_eq!(keeps.len(), 2, "only b@x.com's two subject stacks");
+        assert!(keeps.iter().all(|r| r["sender"] == "b@x.com"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn unsub_done_logs_chains_trash_prompt_and_clears_busy() {
-        let path = std::env::temp_dir().join(format!(
-            "mailprune-app-test-unsub-{}.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_log("unsub");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.busy = true;
         app.on_task_done(TaskDone::Unsub {
