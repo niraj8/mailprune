@@ -6,6 +6,7 @@ use crate::imap_client::ImapClient;
 use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
 use std::collections::HashSet;
+use tokio::sync::mpsc;
 
 pub enum Mode {
     Normal,
@@ -67,6 +68,39 @@ impl PendingAction {
     }
 }
 
+/// messages sent from a spawned action task back to the event loop
+pub enum TaskMsg {
+    /// progress line for the status bar
+    Status(String),
+    Done(TaskDone),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ImapKind {
+    Trash,
+    Archive,
+    Read,
+}
+
+pub enum TaskDone {
+    /// an IMAP mutation finished; the client comes back with it (discarded
+    /// on error — the session state is unknown after a failure/timeout)
+    Imap {
+        client: Box<ImapClient>,
+        kind: ImapKind,
+        stack_idxs: Vec<usize>,
+        n_msgs: usize,
+        label: String,
+        result: Result<()>,
+    },
+    Unsub {
+        stack_idxs: Vec<usize>,
+        ok_idxs: Vec<usize>,
+        failed: usize,
+        last: String,
+    },
+}
+
 pub struct AccountView {
     pub cfg: AccountConfig,
     pub password: Option<String>,
@@ -120,6 +154,9 @@ pub struct App {
     pub busy: bool,
     pub should_quit: bool,
     pub stats: SessionStats,
+    /// receiver for the in-flight action task, if any; while Some, mutating
+    /// keys are blocked so stack indices captured by the task stay valid
+    pub task_rx: Option<mpsc::UnboundedReceiver<TaskMsg>>,
 }
 
 impl App {
@@ -135,6 +172,7 @@ impl App {
             busy: false,
             should_quit: false,
             stats: SessionStats::default(),
+            task_rx: None,
         }
     }
 
@@ -227,12 +265,32 @@ impl App {
         }
         match self.mode {
             Mode::Normal => self.handle_normal(key).await,
-            Mode::Confirm(_) => self.handle_confirm(key).await,
+            Mode::Confirm(_) => self.handle_confirm(key),
             Mode::Filter => self.handle_filter(key),
         }
     }
 
     async fn handle_normal(&mut self, key: KeyEvent) {
+        // while an action task is in flight, only allow keys that can't
+        // mutate or reorder stacks — the task holds indices into them
+        if self.busy {
+            let allowed = matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Char('q'), _)
+                    | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('j'), _)
+                    | (KeyCode::Char('k'), _)
+                    | (KeyCode::Down, _)
+                    | (KeyCode::Up, _)
+                    | (KeyCode::Char('g'), _)
+                    | (KeyCode::Char('G'), _)
+                    | (KeyCode::Enter, _)
+                    | (KeyCode::Esc, _)
+            );
+            if !allowed {
+                return;
+            }
+        }
         let visible = self.visible_stacks();
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -352,7 +410,7 @@ impl App {
             (KeyCode::Char('r'), _) => {
                 let targets = self.target_stacks();
                 if !targets.is_empty() {
-                    self.mark_read(targets).await;
+                    self.spawn_imap(ImapKind::Read, targets);
                 }
             }
             (KeyCode::Char('u'), _) => {
@@ -378,12 +436,12 @@ impl App {
         }
     }
 
-    async fn handle_confirm(&mut self, key: KeyEvent) {
+    fn handle_confirm(&mut self, key: KeyEvent) {
         let Mode::Confirm(action) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.run_action(action).await,
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.run_action(action),
             _ => self.status = "cancelled".into(),
         }
     }
@@ -441,111 +499,178 @@ impl App {
         self.busy = false;
     }
 
-    async fn run_action(&mut self, action: PendingAction) {
+    /// dispatch a confirmed action to a background task so the event loop
+    /// keeps drawing while the network work runs
+    fn run_action(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::Trash { stack_idxs } | PendingAction::TrashAfterUnsub { stack_idxs } => {
+                self.spawn_imap(ImapKind::Trash, stack_idxs)
+            }
+            PendingAction::Archive { stack_idxs } => self.spawn_imap(ImapKind::Archive, stack_idxs),
+            PendingAction::Unsubscribe { stack_idxs } => self.spawn_unsub(stack_idxs),
+        }
+    }
+
+    fn spawn_imap(&mut self, kind: ImapKind, stack_idxs: Vec<usize>) {
+        let (uids, label) = self.collect(&stack_idxs);
+        let acct = self.account_mut();
+        let Some(mut client) = acct.client.take() else {
+            self.status = "not connected — press R to reconnect".into();
+            return;
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.task_rx = Some(rx);
         self.busy = true;
-        let result = match action {
-            PendingAction::Trash { stack_idxs } => self.trash(stack_idxs).await,
-            PendingAction::Archive { stack_idxs } => self.archive(stack_idxs).await,
-            PendingAction::TrashAfterUnsub { stack_idxs } => self.trash(stack_idxs).await,
-            PendingAction::Unsubscribe { stack_idxs } => {
-                let (ok, _failed) = self.unsubscribe_many(&stack_idxs).await;
+        let verb = match kind {
+            ImapKind::Trash => "trashing",
+            ImapKind::Archive => "archiving",
+            ImapKind::Read => "marking read",
+        };
+        self.status = format!("{verb} {} messages…", uids.len());
+        tokio::spawn(async move {
+            let result = match kind {
+                ImapKind::Trash => client.trash(&uids).await,
+                ImapKind::Archive => client.archive(&uids).await,
+                ImapKind::Read => client.mark_read(&uids).await,
+            };
+            let _ = tx.send(TaskMsg::Done(TaskDone::Imap {
+                client: Box::new(client),
+                kind,
+                stack_idxs,
+                n_msgs: uids.len(),
+                label,
+                result,
+            }));
+        });
+    }
+
+    fn spawn_unsub(&mut self, stack_idxs: Vec<usize>) {
+        let acct = self.account();
+        let cfg = acct.cfg.clone();
+        let password = acct.password.clone().unwrap_or_default();
+        // resolve method + name per stack up front; the stacks stay untouched
+        // while the task runs because mutating keys are blocked when busy
+        let jobs: Vec<(usize, String, Option<unsubscribe::Method>)> = stack_idxs
+            .iter()
+            .map(|&i| {
+                let s = &acct.stacks[i];
+                (
+                    i,
+                    s.display_name.clone(),
+                    s.unsubscribe_source().and_then(unsubscribe::pick_method),
+                )
+            })
+            .collect();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.task_rx = Some(rx);
+        self.busy = true;
+        self.status = format!("unsubscribing from {} stacks…", jobs.len());
+        tokio::spawn(async move {
+            let total = jobs.len();
+            let mut ok_idxs: Vec<usize> = Vec::new();
+            let mut failed = 0;
+            let mut last = String::new();
+            for (done, (i, name, method)) in jobs.into_iter().enumerate() {
+                let Some(method) = method else {
+                    failed += 1;
+                    continue;
+                };
+                let _ = tx.send(TaskMsg::Status(format!(
+                    "unsubscribing {}/{total}: {name}…",
+                    done + 1
+                )));
+                crate::debuglog::write(format!("unsub start {name} via {}", method.describe()));
+                match unsubscribe::execute(&method, &cfg, &password).await {
+                    Ok(msg) => {
+                        ok_idxs.push(i);
+                        crate::debuglog::write(format!("unsub done {name}: {msg}"));
+                        last = format!("{name}: {msg}");
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        crate::debuglog::write(format!("unsub FAILED {name}: {e:#}"));
+                        last = format!("{name}: {e:#}");
+                    }
+                }
+            }
+            let _ = tx.send(TaskMsg::Done(TaskDone::Unsub {
+                stack_idxs,
+                ok_idxs,
+                failed,
+                last,
+            }));
+        });
+    }
+
+    /// apply a finished task's outcome to app state (runs on the event loop)
+    pub fn on_task_done(&mut self, done: TaskDone) {
+        self.busy = false;
+        self.task_rx = None;
+        match done {
+            TaskDone::Imap {
+                client,
+                kind,
+                stack_idxs,
+                n_msgs,
+                label,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.account_mut().client = Some(*client);
+                    match kind {
+                        ImapKind::Trash => {
+                            self.remove_stacks(stack_idxs);
+                            self.stats.trashed += n_msgs;
+                            self.status = format!("trashed {n_msgs} messages from {label}");
+                        }
+                        ImapKind::Archive => {
+                            self.remove_stacks(stack_idxs);
+                            self.stats.archived += n_msgs;
+                            self.status = format!("archived {n_msgs} messages from {label}");
+                        }
+                        ImapKind::Read => {
+                            let acct = self.account_mut();
+                            for &i in &stack_idxs {
+                                for m in &mut acct.stacks[i].msgs {
+                                    m.unread = false;
+                                }
+                                acct.stacks[i].unread_count = 0;
+                            }
+                            acct.marked.clear();
+                            self.stats.marked_read += n_msgs;
+                            self.status = format!("marked {n_msgs} messages read ({label})");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // session state unknown after failure/timeout: drop the
+                    // client so the next R reconnects fresh
+                    drop(client);
+                    self.account_mut().client = None;
+                    self.status = format!("error: {e:#}");
+                }
+            },
+            TaskDone::Unsub {
+                stack_idxs,
+                ok_idxs,
+                failed,
+                last,
+            } => {
+                let ok = ok_idxs.len();
+                self.status = if stack_idxs.len() == 1 {
+                    last
+                } else if failed == 0 {
+                    format!("unsubscribed from {ok} stacks")
+                } else {
+                    format!("unsubscribed {ok}/{} stacks (last: {last})", ok + failed)
+                };
+                self.stats.unsubscribed += ok;
                 if ok > 0 {
                     // chain into "also trash?" prompt
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
                 }
-                self.busy = false;
-                return;
-            }
-        };
-        if let Err(e) = result {
-            self.status = format!("error: {e:#}");
-            self.account_mut().client = None;
-        }
-        self.busy = false;
-    }
-
-    async fn trash(&mut self, stack_idxs: Vec<usize>) -> Result<()> {
-        let (uids, label) = self.collect(&stack_idxs);
-        let acct = self.account_mut();
-        acct.client.as_mut().unwrap().trash(&uids).await?;
-        self.remove_stacks(stack_idxs);
-        self.stats.trashed += uids.len();
-        self.status = format!("trashed {} messages from {label}", uids.len());
-        Ok(())
-    }
-
-    async fn archive(&mut self, stack_idxs: Vec<usize>) -> Result<()> {
-        let (uids, label) = self.collect(&stack_idxs);
-        let acct = self.account_mut();
-        acct.client.as_mut().unwrap().archive(&uids).await?;
-        self.remove_stacks(stack_idxs);
-        self.stats.archived += uids.len();
-        self.status = format!("archived {} messages from {label}", uids.len());
-        Ok(())
-    }
-
-    async fn mark_read(&mut self, stack_idxs: Vec<usize>) {
-        self.busy = true;
-        let (uids, label) = self.collect(&stack_idxs);
-        let acct = self.account_mut();
-        let res = acct.client.as_mut().unwrap().mark_read(&uids).await;
-        match res {
-            Ok(()) => {
-                let acct = self.account_mut();
-                for &i in &stack_idxs {
-                    for m in &mut acct.stacks[i].msgs {
-                        m.unread = false;
-                    }
-                    acct.stacks[i].unread_count = 0;
-                }
-                acct.marked.clear();
-                self.stats.marked_read += uids.len();
-                self.status = format!("marked {} messages read ({label})", uids.len());
-            }
-            Err(e) => {
-                self.status = format!("error: {e:#}");
-                self.account_mut().client = None;
             }
         }
-        self.busy = false;
-    }
-
-    /// run unsubscribe for each stack that has a method; returns (ok, failed)
-    async fn unsubscribe_many(&mut self, stack_idxs: &[usize]) -> (usize, usize) {
-        let cfg = self.account().cfg.clone();
-        let password = self.account().password.clone().unwrap_or_default();
-        let mut ok = 0;
-        let mut failed = 0;
-        let mut last = String::new();
-        for &i in stack_idxs {
-            let method = self.account().stacks[i]
-                .unsubscribe_source()
-                .and_then(unsubscribe::pick_method);
-            let Some(method) = method else {
-                failed += 1;
-                continue;
-            };
-            let name = self.account().stacks[i].display_name.clone();
-            match unsubscribe::execute(&method, &cfg, &password).await {
-                Ok(msg) => {
-                    ok += 1;
-                    last = format!("{name}: {msg}");
-                }
-                Err(e) => {
-                    failed += 1;
-                    last = format!("{name}: {e:#}");
-                }
-            }
-        }
-        self.status = if stack_idxs.len() == 1 {
-            last
-        } else if failed == 0 {
-            format!("unsubscribed from {ok} stacks")
-        } else {
-            format!("unsubscribed {ok}/{} stacks (last: {last})", ok + failed)
-        };
-        self.stats.unsubscribed += ok;
-        (ok, failed)
     }
 
     /// merged uids across stacks + a human label for the status line
@@ -576,5 +701,59 @@ impl App {
         if acct.selected >= acct.stacks.len() {
             acct.selected = acct.stacks.len().saturating_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stacks::MsgMeta;
+
+    fn msg(sender: &str) -> MsgMeta {
+        MsgMeta {
+            uid: 1,
+            sender_email: sender.into(),
+            sender_name: String::new(),
+            subject: "hi".into(),
+            date: None,
+            unread: true,
+            list_unsubscribe: None,
+            one_click: false,
+        }
+    }
+
+    fn test_app() -> App {
+        let cfg = AccountConfig {
+            name: "t".into(),
+            email: "me@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        };
+        let mut app = App::new(vec![cfg]);
+        app.accounts[0].stacks = build_stacks(
+            vec![msg("a@x.com"), msg("b@x.com")],
+            GroupBy::Sender,
+            SortBy::Count,
+        );
+        app
+    }
+
+    #[test]
+    fn unsub_done_chains_trash_prompt_and_clears_busy() {
+        let mut app = test_app();
+        app.busy = true;
+        app.on_task_done(TaskDone::Unsub {
+            stack_idxs: vec![0, 1],
+            ok_idxs: vec![0],
+            failed: 1,
+            last: "x".into(),
+        });
+        assert!(!app.busy);
+        assert!(app.task_rx.is_none());
+        assert_eq!(app.stats.unsubscribed, 1);
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(PendingAction::TrashAfterUnsub { .. })
+        ));
     }
 }

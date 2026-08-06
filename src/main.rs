@@ -108,12 +108,60 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
     loop {
         terminal.draw(|f| ui::view::draw(f, app))?;
         if app.should_quit {
+            // an in-flight action must land before we exit: its outcome is
+            // what gets logged, and quitting first would both abandon the
+            // IMAP move mid-flight and mislabel the stack as "keep".
+            // Bounded by the client's own operation timeouts.
+            let Some(mut rx) = app.task_rx.take() else {
+                break;
+            };
+            app.status = "finishing action before exit…".into();
+            terminal.draw(|f| ui::view::draw(f, app))?;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ui::app::TaskMsg::Status(s) => {
+                        app.status = s;
+                        terminal.draw(|f| ui::view::draw(f, app))?;
+                    }
+                    ui::app::TaskMsg::Done(done) => {
+                        app.on_task_done(done);
+                        break;
+                    }
+                }
+            }
             break;
         }
-        match events.next().await {
-            Some(Ok(ev)) => app.handle_event(ev).await,
-            Some(Err(_)) => {}
-            None => break,
+        // while an action task runs, race its messages against key events so
+        // the UI stays live (progress in the status bar, navigation works)
+        if let Some(mut rx) = app.task_rx.take() {
+            tokio::select! {
+                ev = events.next() => {
+                    app.task_rx = Some(rx);
+                    match ev {
+                        Some(Ok(ev)) => app.handle_event(ev).await,
+                        Some(Err(_)) => {}
+                        None => break,
+                    }
+                }
+                msg = rx.recv() => match msg {
+                    Some(ui::app::TaskMsg::Status(s)) => {
+                        app.status = s;
+                        app.task_rx = Some(rx);
+                    }
+                    Some(ui::app::TaskMsg::Done(done)) => app.on_task_done(done),
+                    None => {
+                        // task died without reporting (bug); recover the UI
+                        app.busy = false;
+                        app.status = "error: action task exited unexpectedly".into();
+                    }
+                },
+            }
+        } else {
+            match events.next().await {
+                Some(Ok(ev)) => app.handle_event(ev).await,
+                Some(Err(_)) => {}
+                None => break,
+            }
         }
     }
     Ok(())
