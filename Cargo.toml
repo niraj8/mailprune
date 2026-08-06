@@ -1,6 +1,6 @@
 [package]
 name = "mailprune"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Email triage TUI — stack your inbox by sender, bulk trash/archive/unsubscribe"
 license = "MIT"
