@@ -1,4 +1,5 @@
 mod config;
+mod debuglog;
 mod imap_client;
 mod stacks;
 mod ui;
@@ -64,6 +65,11 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    debuglog::write(format!(
+        "=== session start v{} pid {} ===",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    ));
     let cfg = config::load()?;
     let mut app = ui::app::App::new(cfg.accounts);
 

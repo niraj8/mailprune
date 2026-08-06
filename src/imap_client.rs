@@ -10,6 +10,29 @@ use crate::stacks::MsgMeta;
 
 type Session = async_imap::Session<TlsStream<TcpStream>>;
 
+const OP_TIMEOUT_SECS: u64 = 30;
+/// header fetch of a large inbox legitimately takes a while
+const FETCH_TIMEOUT_SECS: u64 = 180;
+
+/// Gmail drops idle IMAP connections without closing the TCP socket; an
+/// un-timeouted await on such a session blocks forever (frozen TUI). After a
+/// timeout the session state is unknown — callers must drop the client.
+async fn timed<T>(
+    secs: u64,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            crate::debuglog::write(format!("{what} TIMED OUT after {secs}s"));
+            Err(anyhow!(
+                "{what} timed out after {secs}s — connection presumed dead, press R to reconnect"
+            ))
+        }
+    }
+}
+
 pub struct ImapClient {
     session: Session,
     pub trash_folder: String,
@@ -32,6 +55,21 @@ async fn tls_connect(host: &str) -> Result<TlsStream<TcpStream>> {
 
 impl ImapClient {
     pub async fn connect(account: &AccountConfig, password: &str) -> Result<Self> {
+        crate::debuglog::write(format!(
+            "imap connect start {} ({})",
+            account.email, account.imap_host
+        ));
+        let client = timed(
+            OP_TIMEOUT_SECS,
+            "imap connect",
+            Self::connect_inner(account, password),
+        )
+        .await?;
+        crate::debuglog::write(format!("imap connect done {}", account.email));
+        Ok(client)
+    }
+
+    async fn connect_inner(account: &AccountConfig, password: &str) -> Result<Self> {
         let tls = tls_connect(&account.imap_host).await?;
         let client = async_imap::Client::new(tls);
         let mut session = client
@@ -63,14 +101,15 @@ impl ImapClient {
     }
 
     pub async fn fetch_inbox(&mut self) -> Result<Vec<MsgMeta>> {
-        let mailbox = self.session.select("INBOX").await?;
-        if mailbox.exists == 0 {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::with_capacity(mailbox.exists as usize);
-        {
-            let mut stream = self
-                .session
+        crate::debuglog::write("imap fetch start");
+        let session = &mut self.session;
+        let out = timed(FETCH_TIMEOUT_SECS, "imap fetch", async move {
+            let mailbox = session.select("INBOX").await?;
+            if mailbox.exists == 0 {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::with_capacity(mailbox.exists as usize);
+            let mut stream = session
                 .uid_fetch("1:*", "(UID FLAGS INTERNALDATE RFC822.HEADER)")
                 .await?;
             while let Some(fetch) = stream.next().await {
@@ -107,30 +146,51 @@ impl ImapClient {
                     one_click,
                 });
             }
-        }
+            Ok(out)
+        })
+        .await?;
+        crate::debuglog::write(format!("imap fetch done {} msgs", out.len()));
         Ok(out)
     }
 
     pub async fn trash(&mut self, uids: &[u32]) -> Result<()> {
+        crate::debuglog::write(format!("imap trash start {} uids", uids.len()));
         let folder = self.trash_folder.clone();
-        self.session.uid_mv(uid_set(uids), &folder).await?;
+        let session = &mut self.session;
+        timed(OP_TIMEOUT_SECS, "imap trash", async move {
+            session.uid_mv(uid_set(uids), &folder).await?;
+            Ok(())
+        })
+        .await?;
+        crate::debuglog::write("imap trash done");
         Ok(())
     }
 
     pub async fn archive(&mut self, uids: &[u32]) -> Result<()> {
+        crate::debuglog::write(format!("imap archive start {} uids", uids.len()));
         let folder = self.archive_folder.clone();
-        self.session.uid_mv(uid_set(uids), &folder).await?;
+        let session = &mut self.session;
+        timed(OP_TIMEOUT_SECS, "imap archive", async move {
+            session.uid_mv(uid_set(uids), &folder).await?;
+            Ok(())
+        })
+        .await?;
+        crate::debuglog::write("imap archive done");
         Ok(())
     }
 
     pub async fn mark_read(&mut self, uids: &[u32]) -> Result<()> {
-        let mut stream = self
-            .session
-            .uid_store(uid_set(uids), "+FLAGS (\\Seen)")
-            .await?;
-        while let Some(item) = stream.next().await {
-            item?;
-        }
+        crate::debuglog::write(format!("imap mark_read start {} uids", uids.len()));
+        let session = &mut self.session;
+        timed(OP_TIMEOUT_SECS, "imap mark_read", async move {
+            let mut stream = session.uid_store(uid_set(uids), "+FLAGS (\\Seen)").await?;
+            while let Some(item) = stream.next().await {
+                item?;
+            }
+            Ok(())
+        })
+        .await?;
+        crate::debuglog::write("imap mark_read done");
         Ok(())
     }
 

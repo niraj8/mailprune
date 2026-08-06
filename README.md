@@ -96,3 +96,4 @@ The fastest way to inbox zero:
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
 - Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.
 - Passwords live in the Keychain under service `mailprune`. Env override: `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>`.
+- Network operations also leave start/done lines in `~/.local/state/mailprune/debug.log` (rotated at 2 MB) — if the TUI ever hangs, the last line names the operation that never returned. Disable with `MAILPRUNE_NO_DEBUG_LOG=1`.
