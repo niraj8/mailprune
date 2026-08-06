@@ -1,11 +1,12 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
+use crate::action_log::{Action, ActionLog, StackSnapshot};
 use crate::config::AccountConfig;
 use crate::imap_client::ImapClient;
 use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 pub enum Mode {
@@ -112,6 +113,11 @@ pub struct AccountView {
     pub loaded: bool,
     /// stack keys marked for bulk actions
     pub marked: HashSet<String>,
+    /// stacks that were actually rendered on screen this session, with
+    /// features frozen at first sighting — survives refresh and regrouping
+    pub seen: HashMap<String, StackSnapshot>,
+    /// stack keys acted on this session (excluded from "keep" at quit)
+    pub acted: HashSet<String>,
 }
 
 impl AccountView {
@@ -126,6 +132,8 @@ impl AccountView {
             msg_selected: 0,
             loaded: false,
             marked: HashSet::new(),
+            seen: HashMap::new(),
+            acted: HashSet::new(),
         }
     }
 
@@ -154,13 +162,14 @@ pub struct App {
     pub busy: bool,
     pub should_quit: bool,
     pub stats: SessionStats,
+    pub log: ActionLog,
     /// receiver for the in-flight action task, if any; while Some, mutating
     /// keys are blocked so stack indices captured by the task stay valid
     pub task_rx: Option<mpsc::UnboundedReceiver<TaskMsg>>,
 }
 
 impl App {
-    pub fn new(accounts: Vec<AccountConfig>) -> Self {
+    pub fn new(accounts: Vec<AccountConfig>, log: ActionLog) -> Self {
         Self {
             accounts: accounts.into_iter().map(AccountView::new).collect(),
             active: 0,
@@ -172,6 +181,7 @@ impl App {
             busy: false,
             should_quit: false,
             stats: SessionStats::default(),
+            log,
             task_rx: None,
         }
     }
@@ -223,6 +233,46 @@ impl App {
                 .filter(|(_, s)| acct.marked.contains(&s.key))
                 .map(|(i, _)| i)
                 .collect()
+        }
+    }
+
+    /// called by the view with the stack rows actually on screen this frame;
+    /// features are frozen at first sighting
+    pub fn record_seen(&mut self, stack_idxs: &[usize]) {
+        let acct = self.account_mut();
+        for &i in stack_idxs {
+            let key = &acct.stacks[i].key;
+            if !acct.seen.contains_key(key) {
+                acct.seen
+                    .insert(key.clone(), StackSnapshot::of(&acct.stacks[i]));
+            }
+        }
+    }
+
+    /// snapshot the stacks as they are right now and append to the log
+    fn log_action(&mut self, action: Action, stack_idxs: &[usize]) {
+        let acct = &mut self.accounts[self.active];
+        let snaps: Vec<StackSnapshot> = stack_idxs
+            .iter()
+            .map(|&i| StackSnapshot::of(&acct.stacks[i]))
+            .collect();
+        for &i in stack_idxs {
+            acct.acted.insert(acct.stacks[i].key.clone());
+        }
+        self.log.log(&acct.cfg.email, action, &snaps);
+    }
+
+    /// at session end, stacks seen on screen but never acted on are "keep"
+    pub fn flush_keeps(&mut self) {
+        for acct in &self.accounts {
+            let mut keeps: Vec<StackSnapshot> = acct
+                .seen
+                .iter()
+                .filter(|(key, _)| !acct.acted.contains(*key))
+                .map(|(_, snap)| snap.clone())
+                .collect();
+            keeps.sort_by(|a, b| (&a.sender, &a.subject).cmp(&(&b.sender, &b.subject)));
+            self.log.log(&acct.cfg.email, Action::Keep, &keeps);
         }
     }
 
@@ -619,16 +669,21 @@ impl App {
                     self.account_mut().client = Some(*client);
                     match kind {
                         ImapKind::Trash => {
+                            self.log_action(Action::Trash, &stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.trashed += n_msgs;
                             self.status = format!("trashed {n_msgs} messages from {label}");
                         }
                         ImapKind::Archive => {
+                            self.log_action(Action::Archive, &stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.archived += n_msgs;
                             self.status = format!("archived {n_msgs} messages from {label}");
                         }
                         ImapKind::Read => {
+                            // snapshot before mutating flags so the log shows
+                            // the read rate the user actually acted on
+                            self.log_action(Action::Read, &stack_idxs);
                             let acct = self.account_mut();
                             for &i in &stack_idxs {
                                 for m in &mut acct.stacks[i].msgs {
@@ -665,6 +720,7 @@ impl App {
                     format!("unsubscribed {ok}/{} stacks (last: {last})", ok + failed)
                 };
                 self.stats.unsubscribed += ok;
+                self.log_action(Action::Unsub, &ok_idxs);
                 if ok > 0 {
                     // chain into "also trash?" prompt
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
@@ -722,14 +778,14 @@ mod tests {
         }
     }
 
-    fn test_app() -> App {
+    fn test_app(log: ActionLog) -> App {
         let cfg = AccountConfig {
             name: "t".into(),
             email: "me@x.com".into(),
             imap_host: "imap".into(),
             smtp_host: "smtp".into(),
         };
-        let mut app = App::new(vec![cfg]);
+        let mut app = App::new(vec![cfg], log);
         app.accounts[0].stacks = build_stacks(
             vec![msg("a@x.com"), msg("b@x.com")],
             GroupBy::Sender,
@@ -739,8 +795,43 @@ mod tests {
     }
 
     #[test]
-    fn unsub_done_chains_trash_prompt_and_clears_busy() {
-        let mut app = test_app();
+    fn keeps_are_seen_minus_acted() {
+        let path =
+            std::env::temp_dir().join(format!("mailprune-app-test-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.record_seen(&[0, 1]);
+        // re-sighting must not overwrite the first snapshot
+        app.record_seen(&[0]);
+        let a_idx = app.accounts[0]
+            .stacks
+            .iter()
+            .position(|s| s.key == "a@x.com")
+            .unwrap();
+        app.log_action(Action::Trash, &[a_idx]);
+        app.flush_keeps();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let recs: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["action"], "trash");
+        assert_eq!(recs[0]["sender"], "a@x.com");
+        assert_eq!(recs[1]["action"], "keep");
+        assert_eq!(recs[1]["sender"], "b@x.com");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unsub_done_logs_chains_trash_prompt_and_clears_busy() {
+        let path = std::env::temp_dir().join(format!(
+            "mailprune-app-test-unsub-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app(ActionLog::at(path.clone()));
         app.busy = true;
         app.on_task_done(TaskDone::Unsub {
             stack_idxs: vec![0, 1],
@@ -749,11 +840,34 @@ mod tests {
             last: "x".into(),
         });
         assert!(!app.busy);
-        assert!(app.task_rx.is_none());
         assert_eq!(app.stats.unsubscribed, 1);
         assert!(matches!(
             app.mode,
             Mode::Confirm(PendingAction::TrashAfterUnsub { .. })
         ));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let recs: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs.len(), 1); // only the successful unsub is logged
+        assert_eq!(recs[0]["action"], "unsub");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unseen_stacks_are_not_logged_as_keeps() {
+        let path = std::env::temp_dir().join(format!(
+            "mailprune-app-test-unseen-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.record_seen(&[0]); // second stack never rendered
+        app.flush_keeps();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        std::fs::remove_file(&path).unwrap();
     }
 }

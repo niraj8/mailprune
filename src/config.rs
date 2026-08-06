@@ -24,6 +24,13 @@ fn default_smtp_host() -> String {
 pub struct Config {
     #[serde(rename = "accounts")]
     pub accounts: Vec<AccountConfig>,
+    /// log triage decisions to a local JSONL (see action_log.rs)
+    #[serde(default = "default_true")]
+    pub action_log: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -32,6 +39,10 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub const SAMPLE_CONFIG: &str = r#"# mailprune config
+
+# action_log = true   # log triage decisions (headers only, stays local) to
+#                     # ~/.local/state/mailprune/actions.jsonl
+
 [[accounts]]
 name = "personal"
 email = "you@gmail.com"

@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::app::{App, Mode};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -48,7 +48,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_stack_list(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let acct = app.account();
     let visible = app.visible_stacks();
     let marked = if acct.marked.is_empty() {
@@ -135,6 +135,17 @@ fn draw_stack_list(frame: &mut Frame, app: &App, area: Rect) {
         state.select(Some(acct.selected.min(visible.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
+
+    // rows actually on screen become "seen" for the action log; the render
+    // updated state.offset() to the real scroll position
+    let rows = area.height.saturating_sub(2) as usize; // minus borders
+    let on_screen: Vec<usize> = visible
+        .iter()
+        .skip(state.offset())
+        .take(rows)
+        .copied()
+        .collect();
+    app.record_seen(&on_screen);
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {

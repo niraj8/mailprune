@@ -1,3 +1,4 @@
+mod action_log;
 mod config;
 mod debuglog;
 mod imap_client;
@@ -71,11 +72,14 @@ async fn main() -> Result<()> {
         std::process::id()
     ));
     let cfg = config::load()?;
-    let mut app = ui::app::App::new(cfg.accounts);
+    let log = action_log::ActionLog::new(cfg.action_log);
+    let mut app = ui::app::App::new(cfg.accounts, log);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app).await;
     ratatui::restore();
+    // stacks seen on screen but never acted on become implicit "keep" labels
+    app.flush_keeps();
 
     let s = &app.stats;
     let cleaned = s.trashed + s.archived;

@@ -13,22 +13,12 @@ const ROTATE_BYTES: u64 = 2 * 1024 * 1024;
 
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// $XDG_STATE_HOME/mailprune, default ~/.local/state/mailprune
-pub fn state_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("mailprune")
-}
-
 fn path() -> Option<&'static PathBuf> {
     PATH.get_or_init(|| {
         if std::env::var_os("MAILPRUNE_NO_DEBUG_LOG").is_some() {
             return None;
         }
-        let path = state_dir().join("debug.log");
+        let path = crate::action_log::state_dir().join("debug.log");
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok()?;
         }
