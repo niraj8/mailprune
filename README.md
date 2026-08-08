@@ -5,18 +5,36 @@ mark-read, or **unsubscribe** from hundreds of emails in a few keystrokes. Built
 fast inbox-zero over Gmail IMAP, multi-account.
 
 ```
- mailprune  personal  work
-┌ stacks (42) · 873 msgs · by sender · sort read rate · 2 marked ─┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
-│▌ 214   0% U DoorDash (12 new)                                   ││ 2026-06-09 ● Your order is on the way                     │
-│▌ 120   2% U Medium Daily Digest                                 ││ 2026-06-08   Craving something new?                       │
-│   76  31% U LinkedIn                                            ││ 2026-06-07   Weekend deals near you                       │
-│   31  94%   GitHub                                              ││ ...                                                       │
-└─────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
- 42 stacks · 873 msgs                                             s group  o sort  Tab acct
+ mailprune  personal  work                          12 trashed · 40 archived · 3 unsubbed
+┌ stacks (42) · 873 of 137,482 msgs · by sender · sort read rate · 2 marked ┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
+│▌ 214   0% U DoorDash (12 new)                                             ││ 2026-06-09 ● Your order is on the way                     │
+│▌ 120   2% U Medium Daily Digest                                           ││ 2026-06-08   Craving something new?                       │
+│   76  31% U LinkedIn                                                      ││ 2026-06-07   Weekend deals near you                       │
+│   31  94%   GitHub                                                        ││ ...                                                       │
+└───────────────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
+ personal: 873 of 137,482 messages in 42 stacks                   m more  s group  o sort  Tab acct
  j/k move  ↵ open  Space mark  d trash  e archive  u unsub  / filter  ? keys
 ```
 
 Needs a terminal of at least 80x24; below that mailprune asks you to resize rather than drawing a squeezed layout.
+
+## How loading works
+
+mailprune never downloads your whole mailbox. On start it takes one cheap list
+of message IDs (a few hundred KB even at 100k messages), reads the newest
+headers until it has found **40 senders**, then asks the server for every
+message each of those senders has in your inbox. Stacks appear as each sender
+resolves, usually within a second.
+
+So the *set* of stacks on screen is a recent-senders window — but every **count
+is the sender's true inbox-wide total**, and `d` really does trash all of it,
+including messages that were never on screen. The pane title shows both numbers
+(`873 of 137,482`), and both fall as you triage.
+
+Press `m` for the next 40 senders. Loading is always explicit: the pane drains
+as you clear it and refills only when you ask. A count prefixed with `~` means
+the server refused part of that sender's listing, so the count is short and
+trashing the stack will under-clear — press `R` to reload.
 
 ## Install
 
@@ -75,11 +93,12 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 | `u` | unsubscribe — RFC 8058 one-click POST → mailto via SMTP → browser fallback; then offers to trash the stack |
 | `Space` | mark stack for bulk action (auto-advances; `d`/`e`/`r`/`u` then apply to all marked) |
 | `a` | mark all visible stacks (again to clear) |
-| `s` | toggle grouping: sender ↔ sender+subject |
-| `o` | toggle sort: count ↔ read rate (least-read first — your dead newsletters) |
+| `m` | load 40 more senders, appended to the end |
+| `s` | toggle grouping: sender (default) ↔ sender+subject |
+| `o` | toggle sort: count (default) ↔ read rate (least-read first — your dead newsletters), re-sorting everything loaded |
 | `/` | filter stacks by sender |
 | `Tab` | next account |
-| `R` | refresh |
+| `R` | reload from scratch — new message list, stacks cleared |
 | `g` / `G` | top / bottom |
 | `?` | full key overlay (any key closes) |
 | `q` | quit |
@@ -94,9 +113,16 @@ The fastest way to inbox zero:
 4. `y` again at the "also trash?" prompt.
 5. `s` to regroup by sender+subject and repeat for noisy notification types
    from senders you otherwise keep.
+6. `m` when the pane runs dry, and go again.
 
 ## Notes
 
+- A stack is a set of messages, not a Gmail conversation. Under `s`
+  (sender+subject) the key normalizes `Re:`/`Fwd:` and digit runs, so
+  `Order #123 shipped` and `Order #456 shipped` land together — that is the
+  point for newsletters. Either way `d` trashes only the *inbox* copies: if you
+  ever replied, your Sent copy keeps the Gmail conversation alive. Newsletters
+  have no replies, so this never bites in the case mailprune is built for.
 - Inside an expanded stack, dates within the last 30 days are bold — recent mail separates from the backlog at a glance.
 - Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.

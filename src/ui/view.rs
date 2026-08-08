@@ -3,7 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+
+use crate::imap_client::SENDERS_PER_BATCH;
 
 use super::app::{App, Mode};
 
@@ -85,7 +87,78 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(acct.cfg.name.clone(), style));
     }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // the session's running totals ride the free end of this row: the pane
+    // title below is already at capacity, and this puts them next to the
+    // message counts they relate to
+    let free = (area.width as usize).saturating_sub(used + 2);
+    let Some(counters) = session_counters(&app.stats, free) else {
+        return;
+    };
+    let width = counters.chars().count() as u16;
+    let right = Rect {
+        x: area.x + area.width - width - 1,
+        y: area.y,
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            counters,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        right,
+    );
+}
+
+/// What this session has actually cleared, in `max` columns or fewer, or None
+/// when nothing has been done yet — the row stays empty until it has something
+/// to say. Abbreviates to the action keys before it gives up.
+fn session_counters(stats: &super::app::SessionStats, max: usize) -> Option<String> {
+    let parts: [(usize, &str, &str); 4] = [
+        (stats.trashed, "trashed", "d"),
+        (stats.archived, "archived", "e"),
+        (stats.marked_read, "read", "r"),
+        (stats.unsubscribed, "unsubbed", "u"),
+    ];
+    let join = |short: bool| -> String {
+        parts
+            .iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, long, abbrev)| {
+                if short {
+                    format!("{n}{abbrev}")
+                } else {
+                    format!("{n} {long}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let full = join(false);
+    if full.is_empty() {
+        return None;
+    }
+    if full.chars().count() <= max {
+        return Some(full);
+    }
+    let short = join(true);
+    (short.chars().count() <= max).then_some(short)
+}
+
+/// 137482 -> "137,482" — a six-figure mailbox total is unreadable without it
+fn commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// a sender name never needs more than this, however wide the pane gets
@@ -118,12 +191,20 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // change, so they are the last things to go; the labels around them and
     // the message total drop first
     let title = if app.filter.is_empty() {
-        let (n, msgs) = (visible.len(), acct.total_messages());
+        let n = visible.len();
+        // loaded of mailbox-wide, because the loaded set is a recency window
+        // while every count in it is the sender's true total. Both numbers
+        // fall as you triage: the denominator shrinking is the mailbox
+        // actually getting smaller.
+        let (loaded, total) = (commas(acct.loaded_messages()), commas(acct.inbox_total()));
         let (group, sort) = (app.group_by.label(), app.sort_by.label());
         first_that_fits(
             &[
-                format!(" stacks ({n}) · {msgs} msgs · by {group} · sort {sort}{marked} "),
-                format!(" stacks ({n}) · by {group} · sort {sort}{marked} "),
+                format!(
+                    " stacks ({n}) · {loaded} of {total} msgs · by {group} · sort {sort}{marked} "
+                ),
+                format!(" stacks ({n}) · {loaded}/{total} · by {group} · sort {sort}{marked} "),
+                format!(" stacks ({n}) · {loaded}/{total} · {group} · {sort}{marked} "),
                 format!(" stacks ({n}) · {group} · {sort}{marked} "),
                 format!(" {n} · {group} · {sort}{marked} "),
                 format!(" {n} · {group} · {sort}{marked_short} "),
@@ -147,7 +228,15 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let s = &acct.stacks[i];
             let is_marked = acct.marked.contains(&s.key);
             let mark = if is_marked { "▌" } else { " " };
-            let count = format!("{:>4}", s.msgs.len());
+            // a refused fan-out leaves only the discovery sample, so the count
+            // under-reports and trashing the stack under-clears. The marker is
+            // the warning; it shares the count's width rather than costing a
+            // column of its own.
+            let count = if acct.is_partial(s) {
+                format!("{:>4}", format!("~{}", s.msgs.len()))
+            } else {
+                format!("{:>4}", s.msgs.len())
+            };
             let badge = if s.can_unsubscribe { "U" } else { " " };
             let rate = s.read_rate();
             let rate_style = match rate {
@@ -207,13 +296,22 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD)
     };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(highlight);
-    let mut state = ListState::default();
-    if !visible.is_empty() {
-        state.select(Some(acct.selected.min(visible.len() - 1)));
+    let block = Block::default().borders(Borders::ALL).title(title);
+    if visible.is_empty() {
+        // this is the pane that drains as you triage, so this is where it has
+        // to say whether there is more behind it
+        frame.render_widget(
+            Paragraph::new(empty_state(app))
+                .style(Style::default().fg(Color::Gray))
+                .wrap(Wrap { trim: true })
+                .block(block),
+            area,
+        );
+        return;
     }
+    let list = List::new(items).block(block).highlight_style(highlight);
+    let mut state = ListState::default();
+    state.select(Some(acct.selected.min(visible.len() - 1)));
     frame.render_stateful_widget(list, area, &mut state);
 
     // rows actually on screen become "seen" for the action log; the render
@@ -228,12 +326,32 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.record_seen(&on_screen);
 }
 
+/// why the stack pane is empty — the one place the UI can tell "cleared the
+/// batch" from "cleared the inbox", and both are worth saying
+fn empty_state(app: &App) -> String {
+    let acct = app.account();
+    if app.loading {
+        "loading…".into()
+    } else if !acct.loaded {
+        "nothing loaded — press R to try again".into()
+    } else if !app.filter.is_empty() {
+        "nothing matches the filter — Esc to clear it".into()
+    } else if acct.exhausted() {
+        "inbox zero — nothing left to triage".into()
+    } else {
+        format!("all clear — press m to load {SENDERS_PER_BATCH} more senders")
+    }
+}
+
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let acct = app.account();
     let Some(stack_idx) = app.selected_stack_idx() else {
-        let p = Paragraph::new("no stacks — inbox zero 🎉")
-            .block(Block::default().borders(Borders::ALL).title(" messages "));
-        frame.render_widget(p, area);
+        // the stack pane carries the explanation; this one just stays out of
+        // the way rather than repeating it
+        frame.render_widget(
+            Block::default().borders(Borders::ALL).title(" messages "),
+            area,
+        );
         return;
     };
     let stack = &acct.stacks[stack_idx];
@@ -330,7 +448,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if !matches!(app.mode, Mode::Normal) {
         return;
     }
-    let view_keys: &[(&str, &str)] = &[("s", "group"), ("o", "sort"), ("Tab", "acct")];
+    let view_keys: &[(&str, &str)] = &[
+        ("m", "more"),
+        ("s", "group"),
+        ("o", "sort"),
+        ("Tab", "acct"),
+    ];
     let free = (area.width as usize).saturating_sub(status_width + 2);
     let spans = hint_spans(view_keys, free);
     if spans.is_empty() {
@@ -408,7 +531,14 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// every binding, grouped, shown over a dimmed frame. any key dismisses.
+///
+/// `SECTIONS` is `const`, so the batch size in the `m` row is a literal. This
+/// makes it a build error rather than a silent drift if the constant moves.
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+    const _: () = assert!(
+        SENDERS_PER_BATCH == 40,
+        "the `m` help row and the README still say 40"
+    );
     const SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         (
             "move",
@@ -439,10 +569,11 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         (
             "view",
             &[
+                ("m", "load 40 more senders"),
                 ("s", "group by sender / subject"),
-                ("o", "cycle sort"),
+                ("o", "re-sort everything loaded"),
                 ("/", "filter"),
-                ("R", "refresh"),
+                ("R", "reload from scratch"),
                 ("q", "quit"),
             ],
         ),
@@ -531,7 +662,7 @@ mod tests {
     /// the status row with the right-aligned view hints stripped off
     fn status_text(app: &mut App) -> String {
         let row = status_row(app);
-        let cut = row.find("  s group").unwrap_or(row.len());
+        let cut = row.find("  m more").unwrap_or(row.len());
         row[..cut].trim_end().to_string()
     }
 
@@ -638,9 +769,22 @@ mod tests {
     fn app_with(msgs: Vec<MsgMeta>, group_by: GroupBy) -> App {
         let mut app = test_app();
         app.group_by = group_by;
+        let uids: Vec<u32> = msgs.iter().map(|m| m.uid).collect();
         app.account_mut().stacks = build_stacks(msgs, group_by, SortBy::Count);
+        app.account_mut().cursor = uids.len();
+        app.account_mut().uids = uids;
         app.account_mut().loaded = true;
         app
+    }
+
+    /// the tab row, trailing blanks trimmed
+    fn tab_row(app: &mut App, w: u16) -> String {
+        render(app, w, MIN_HEIGHT)
+            .lines()
+            .next()
+            .unwrap()
+            .trim_end()
+            .to_string()
     }
 
     #[test]
@@ -772,7 +916,7 @@ mod tests {
         assert!(f.ends_with("? keys"));
 
         let status = status_row(&mut app);
-        for hint in ["s group", "o sort", "Tab acct"] {
+        for hint in ["m more", "s group", "o sort", "Tab acct"] {
             assert!(
                 status.contains(hint),
                 "{hint:?} missing from status {status:?}"
@@ -835,6 +979,110 @@ mod tests {
         let frame = render(&mut app, 80, 24);
         assert!(frame.contains("unsubscribe"), "overlay lists every binding");
         assert!(frame.contains("any key to close"));
+    }
+
+    /// the loaded set is a recency window, so a title reporting only what is
+    /// loaded says "412" whether the mailbox holds 412 messages or 137,482
+    #[test]
+    fn the_pane_title_reports_the_mailbox_total_not_the_loaded_count() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.account_mut().uids = (1..=137_482).collect();
+        app.account_mut().cursor = 100;
+
+        let title = render(&mut app, 200, MIN_HEIGHT)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert!(
+            title.contains("1 of 137,482 msgs"),
+            "loaded-of-total lost: {title:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_senders_count_is_marked_short_rather_than_read_as_the_truth() {
+        let mut app = app_with(
+            vec![
+                msg(1, "a@x.com", "Alice", "hi"),
+                msg(2, "b@x.com", "Bob", "yo"),
+            ],
+            GroupBy::Sender,
+        );
+        app.account_mut().partial_senders.insert("a@x.com".into());
+
+        let rows = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join("\n");
+        let alice = rows.lines().find(|r| r.contains("Alice")).unwrap();
+        let bob = rows.lines().find(|r| r.contains("Bob")).unwrap();
+        assert!(alice.contains("~1"), "no short-count marker: {alice:?}");
+        assert!(!bob.contains('~'), "the others are unmarked: {bob:?}");
+    }
+
+    /// clearing the batch and clearing the inbox look identical otherwise, and
+    /// the explanation belongs in the pane that actually drained
+    #[test]
+    fn the_emptied_stack_pane_says_whether_there_is_more_to_load() {
+        let mut app = app_with(vec![], GroupBy::Sender);
+        app.account_mut().uids = vec![9, 8, 7];
+        app.account_mut().cursor = 1;
+        let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
+        assert!(pane.contains("press m to load"), "{pane:?}");
+
+        app.account_mut().cursor = 3;
+        let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
+        assert!(pane.contains("inbox zero"), "{pane:?}");
+        assert!(!pane.contains("press m to load"));
+
+        // a load that never landed is not an empty inbox
+        app.account_mut().loaded = false;
+        let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
+        assert!(pane.contains("press R"), "{pane:?}");
+        app.loading = true;
+        let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
+        assert!(pane.contains("loading"), "{pane:?}");
+    }
+
+    #[test]
+    fn session_counters_stay_hidden_until_there_is_something_to_show() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        assert_eq!(tab_row(&mut app, 80), " mailprune   t");
+
+        app.stats.trashed = 12;
+        app.stats.archived = 40;
+        app.stats.unsubscribed = 3;
+        let row = tab_row(&mut app, 80);
+        assert!(
+            row.ends_with("12 trashed · 40 archived · 3 unsubbed"),
+            "{row:?}"
+        );
+        assert!(row.starts_with(" mailprune "), "the tabs keep their place");
+    }
+
+    #[test]
+    fn session_counters_abbreviate_before_they_disappear() {
+        use super::super::app::SessionStats;
+        let stats = SessionStats {
+            trashed: 12,
+            archived: 40,
+            marked_read: 0,
+            unsubscribed: 3,
+        };
+        assert_eq!(
+            session_counters(&stats, 80).unwrap(),
+            "12 trashed · 40 archived · 3 unsubbed",
+            "zero-valued counters are omitted"
+        );
+        assert_eq!(session_counters(&stats, 20).unwrap(), "12d · 40e · 3u");
+        assert_eq!(session_counters(&stats, 5), None, "no room means nothing");
+        assert_eq!(session_counters(&SessionStats::default(), 80), None);
+    }
+
+    #[test]
+    fn six_figure_totals_are_grouped() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(412), "412");
+        assert_eq!(commas(1_000), "1,000");
+        assert_eq!(commas(137_482), "137,482");
     }
 
     #[test]
