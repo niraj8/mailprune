@@ -149,8 +149,6 @@ pub struct AccountView {
     pub client: Option<ImapClient>,
     pub stacks: Vec<Stack>,
     pub selected: usize,
-    pub expanded: bool,
-    pub msg_selected: usize,
     pub loaded: bool,
     /// every uid in INBOX, newest first, taken once per reset. UIDs are
     /// immutable, so the cursor below survives trashing — sequence numbers
@@ -191,8 +189,6 @@ impl AccountView {
             client: None,
             stacks: Vec::new(),
             selected: 0,
-            expanded: false,
-            msg_selected: 0,
             loaded: false,
             uids: Vec::new(),
             cursor: 0,
@@ -376,8 +372,6 @@ impl App {
                 .collect::<Vec<_>>();
             acct.stacks = build_stacks(msgs, group_by, sort_by);
             acct.selected = 0;
-            acct.expanded = false;
-            acct.msg_selected = 0;
             acct.marked.clear();
             // snapshots describe stacks that no longer exist; keeping them
             // would log these messages as "keep" twice, once per grouping.
@@ -448,8 +442,6 @@ impl App {
             acct.partial_senders.clear();
             acct.marked.clear();
             acct.selected = 0;
-            acct.expanded = false;
-            acct.msg_selected = 0;
             acct.loaded = false;
             // `seen` is kept: a reset keeps the current grouping, so its
             // snapshots still describe the same stacks
@@ -595,9 +587,9 @@ impl App {
                     | (KeyCode::Char('k'), _)
                     | (KeyCode::Down, _)
                     | (KeyCode::Up, _)
-                    | (KeyCode::Char('g'), _)
+                    | (KeyCode::Home, _)
+                    | (KeyCode::End, _)
                     | (KeyCode::Char('G'), _)
-                    | (KeyCode::Enter, _)
                     | (KeyCode::Esc, _)
                     | (KeyCode::Char('?'), _)
             );
@@ -614,19 +606,10 @@ impl App {
             }
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.move_sel(1, &visible),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.move_sel(-1, &visible),
-            (KeyCode::Char('g'), _) => self.jump_sel(0, &visible),
-            (KeyCode::Char('G'), _) => self.jump_sel(usize::MAX, &visible),
-            (KeyCode::Enter, _) => {
-                let acct = self.account_mut();
-                if !acct.stacks.is_empty() {
-                    acct.expanded = !acct.expanded;
-                    acct.msg_selected = 0;
-                }
-            }
+            (KeyCode::Home, _) => self.jump_sel(0, &visible),
+            (KeyCode::End, _) | (KeyCode::Char('G'), _) => self.jump_sel(usize::MAX, &visible),
             (KeyCode::Esc, _) => {
-                if self.account().expanded {
-                    self.account_mut().expanded = false;
-                } else if !self.account().marked.is_empty() {
+                if !self.account().marked.is_empty() {
                     self.account_mut().marked.clear();
                 } else if !self.filter.is_empty() {
                     self.filter.clear();
@@ -634,42 +617,36 @@ impl App {
                 }
             }
             (KeyCode::Char(' '), _) => {
-                if !self.account().expanded {
-                    if let Some(i) = self.selected_stack_idx() {
-                        let key = self.account().stacks[i].key.clone();
-                        let acct = self.account_mut();
-                        if !acct.marked.remove(&key) {
-                            acct.marked.insert(key);
-                        }
-                        // auto-advance for rapid marking
-                        self.move_sel(1, &visible);
+                if let Some(i) = self.selected_stack_idx() {
+                    let key = self.account().stacks[i].key.clone();
+                    let acct = self.account_mut();
+                    if !acct.marked.remove(&key) {
+                        acct.marked.insert(key);
                     }
+                    // auto-advance for rapid marking
+                    self.move_sel(1, &visible);
                 }
             }
             (KeyCode::Char('a'), _) => {
-                if !self.account().expanded {
-                    let keys: Vec<String> = visible
-                        .iter()
-                        .map(|&i| self.account().stacks[i].key.clone())
-                        .collect();
-                    let acct = self.account_mut();
-                    if keys.iter().all(|k| acct.marked.contains(k)) {
-                        for k in &keys {
-                            acct.marked.remove(k);
-                        }
-                    } else {
-                        acct.marked.extend(keys);
+                let keys: Vec<String> = visible
+                    .iter()
+                    .map(|&i| self.account().stacks[i].key.clone())
+                    .collect();
+                let acct = self.account_mut();
+                if keys.iter().all(|k| acct.marked.contains(k)) {
+                    for k in &keys {
+                        acct.marked.remove(k);
                     }
+                } else {
+                    acct.marked.extend(keys);
                 }
             }
-            (KeyCode::Char('o'), _) => {
+            (KeyCode::Char('s'), _) => {
                 self.sort_by = self.sort_by.toggle();
                 let sort_by = self.sort_by;
                 for acct in &mut self.accounts {
                     sort_stacks(&mut acct.stacks, sort_by);
                     acct.selected = 0;
-                    acct.expanded = false;
-                    acct.msg_selected = 0;
                 }
                 self.status = format!("sorting by {}", sort_by.label());
             }
@@ -687,7 +664,7 @@ impl App {
             (KeyCode::Char('?'), _) => self.mode = Mode::Help,
             (KeyCode::Char('m'), _) => self.load_more(),
             (KeyCode::Char('R'), _) => self.spawn_batch(Load::Reset),
-            (KeyCode::Char('s'), _) => self.regroup(self.group_by.toggle()),
+            (KeyCode::Char('g'), _) => self.regroup(self.group_by.toggle()),
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::Filter;
                 self.filter.clear();
@@ -767,13 +744,7 @@ impl App {
 
     fn move_sel(&mut self, delta: i64, visible: &[usize]) {
         let acct = self.account_mut();
-        if acct.expanded {
-            if let Some(&i) = visible.get(acct.selected) {
-                let len = acct.stacks[i].msgs.len();
-                let cur = acct.msg_selected as i64 + delta;
-                acct.msg_selected = cur.clamp(0, len as i64 - 1) as usize;
-            }
-        } else if !visible.is_empty() {
+        if !visible.is_empty() {
             let cur = acct.selected as i64 + delta;
             acct.selected = cur.clamp(0, visible.len() as i64 - 1) as usize;
         }
@@ -781,13 +752,7 @@ impl App {
 
     fn jump_sel(&mut self, pos: usize, visible: &[usize]) {
         let acct = self.account_mut();
-        if acct.expanded {
-            if let Some(&i) = visible.get(acct.selected) {
-                acct.msg_selected = pos.min(acct.stacks[i].msgs.len().saturating_sub(1));
-            }
-        } else {
-            acct.selected = pos.min(visible.len().saturating_sub(1));
-        }
+        acct.selected = pos.min(visible.len().saturating_sub(1));
     }
 
     /// dispatch a confirmed action to a background task so the event loop
@@ -1087,8 +1052,6 @@ impl App {
             acct.stacks.remove(i);
         }
         acct.marked.clear();
-        acct.expanded = false;
-        acct.msg_selected = 0;
         if acct.selected >= acct.stacks.len() {
             acct.selected = acct.stacks.len().saturating_sub(1);
         }
@@ -1418,6 +1381,90 @@ mod tests {
         app.handle_normal(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert!(app.task_rx.is_none(), "no load was spawned");
         assert!(app.status.contains("no more senders"), "{}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_normal(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// `g` groups, `s` sorts — the two keys whose old names (`s` and `o`) said
+    /// nothing about what they did
+    #[test]
+    fn g_regroups_and_s_resorts() {
+        let path = temp_log("keys-gs");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        assert_eq!(app.group_by, GroupBy::Sender);
+        assert_eq!(app.sort_by, SortBy::Count);
+
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.group_by, GroupBy::SenderSubject);
+        assert_eq!(
+            app.account().stacks.len(),
+            4,
+            "regrouped, one stack per sender+subject"
+        );
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.sort_by, SortBy::ReadRate);
+        assert!(app.status.contains("read rate"), "{}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn home_and_end_jump_the_stack_list() {
+        let path = temp_log("keys-homeend");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let last = app.account().stacks.len() - 1;
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.account().selected, last);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.account().selected, 0);
+        // G stays bound for vim muscle memory
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.account().selected, last);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the expand mode is gone: Enter had no per-message action behind it, and
+    /// `o` was freed rather than kept as a hidden sort alias
+    #[test]
+    fn enter_and_o_do_nothing() {
+        let path = temp_log("keys-dead");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        press(&mut app, KeyCode::Char('j'));
+        let selected = app.account().selected;
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('o'));
+
+        assert_eq!(app.account().selected, selected, "selection untouched");
+        assert_eq!(app.group_by, GroupBy::Sender);
+        assert_eq!(app.sort_by, SortBy::Count);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `g` reorders the stacks an in-flight task indexes into, so it has to be
+    /// blocked while busy even though the key it replaced (jump to top) was safe
+    #[test]
+    fn g_is_refused_while_an_action_is_in_flight() {
+        let path = temp_log("keys-busy");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.busy = true;
+
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.group_by, GroupBy::Sender, "regroup refused");
+        assert!(app.status.starts_with("busy"), "{}", app.status);
+
+        app.status.clear();
+        press(&mut app, KeyCode::End);
+        assert_eq!(
+            app.account().selected,
+            app.account().stacks.len() - 1,
+            "moving the cursor is still allowed"
+        );
+        assert!(app.status.is_empty(), "{}", app.status);
         let _ = std::fs::remove_file(&path);
     }
 

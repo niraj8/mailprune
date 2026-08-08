@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_stack_list(frame, app, panes[0]);
     draw_detail(frame, app, panes[1]);
     draw_status(frame, app, outer[2]);
-    draw_help(frame, app, outer[3]);
+    draw_help(frame, outer[3]);
 
     if matches!(app.mode, Mode::Help) {
         draw_help_overlay(frame, frame.area());
@@ -288,14 +288,10 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let highlight = if acct.expanded {
-        Style::default().bg(Color::DarkGray)
-    } else {
-        Style::default()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    };
+    let highlight = Style::default()
+        .bg(Color::Cyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default().borders(Borders::ALL).title(title);
     if visible.is_empty() {
         // this is the pane that drains as you triage, so this is where it has
@@ -393,22 +389,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             ]))
         })
         .collect();
-    let highlight = if acct.expanded {
-        Style::default()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(highlight);
-    let mut state = ListState::default();
-    if acct.expanded {
-        state.select(Some(acct.msg_selected.min(stack.msgs.len() - 1)));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
+    // no cursor of its own: this pane follows the stack selection, and every
+    // action works on the whole stack
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
 }
 
 /// braille spinner, one frame per event-loop tick while busy
@@ -448,10 +432,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if !matches!(app.mode, Mode::Normal) {
         return;
     }
+    // group before sort: it is the coarser control, so it is the one worth
+    // keeping when a narrow terminal drops the tail
     let view_keys: &[(&str, &str)] = &[
         ("m", "more"),
-        ("s", "group"),
-        ("o", "sort"),
+        ("g", "group"),
+        ("s", "sort"),
         ("Tab", "acct"),
     ];
     let free = (area.width as usize).saturating_sub(status_width + 2);
@@ -497,34 +483,23 @@ fn hint_spans<'a>(hints: &[(&'a str, &'a str)], max: usize) -> Vec<Span<'a>> {
 
 /// keys that change what happens to mail. the ones that only change the
 /// *view* ride along on the status row instead — see `draw_status`.
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    let hints: &[(&str, &str)] = if app.account().expanded {
-        &[
-            ("j/k", "move"),
-            ("Esc", "back"),
-            ("d", "trash"),
-            ("e", "archive"),
-            ("r", "read"),
-            ("u", "unsub"),
-        ]
-    } else {
-        &[
-            ("j/k", "move"),
-            ("↵", "open"),
-            ("Space", "mark"),
-            ("d", "trash"),
-            ("e", "archive"),
-            ("u", "unsub"),
-            ("/", "filter"),
-        ]
-    };
+fn draw_help(frame: &mut Frame, area: Rect) {
+    const HINTS: &[(&str, &str)] = &[
+        ("j/k", "move"),
+        ("Space", "mark"),
+        ("d", "trash"),
+        ("e", "archive"),
+        ("r", "read"),
+        ("u", "unsub"),
+        ("/", "filter"),
+    ];
     const HELP: (&str, &str) = ("?", "keys");
 
     let mut spans = vec![Span::raw(" ")];
     // reserve the tail for `? keys`: whatever else gets dropped, the way to
     // find it back must not be
     let budget = (area.width as usize).saturating_sub(1 + hint_width(HELP));
-    spans.extend(hint_spans(hints, budget));
+    spans.extend(hint_spans(HINTS, budget));
     spans.push(Span::raw("  "));
     spans.extend(hint_spans(&[HELP], usize::MAX));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -544,9 +519,8 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "move",
             &[
                 ("j / k, ↓ / ↑", "next / previous"),
-                ("g / G", "top / bottom"),
-                ("Enter", "expand / collapse stack"),
-                ("Esc", "collapse, else clear marks / filter"),
+                ("Home / End", "top / bottom (G = End)"),
+                ("Esc", "clear marks, else clear filter"),
                 ("Tab", "next account"),
             ],
         ),
@@ -570,8 +544,8 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             "view",
             &[
                 ("m", "load 40 more senders"),
-                ("s", "group by sender / subject"),
-                ("o", "re-sort everything loaded"),
+                ("g", "group by sender / subject"),
+                ("s", "re-sort everything loaded"),
                 ("/", "filter"),
                 ("R", "reload from scratch"),
                 ("q", "quit"),
@@ -910,13 +884,13 @@ mod tests {
         let mut app = test_app();
 
         let f = footer(&mut app, 80);
-        for hint in ["j/k move", "↵ open", "Space mark", "d trash", "u unsub"] {
+        for hint in ["j/k move", "Space mark", "d trash", "r read", "u unsub"] {
             assert!(f.contains(hint), "{hint:?} missing from footer {f:?}");
         }
         assert!(f.ends_with("? keys"));
 
         let status = status_row(&mut app);
-        for hint in ["m more", "s group", "o sort", "Tab acct"] {
+        for hint in ["m more", "g group", "s sort", "Tab acct"] {
             assert!(
                 status.contains(hint),
                 "{hint:?} missing from status {status:?}"
@@ -961,13 +935,13 @@ mod tests {
     #[test]
     fn view_hints_yield_the_status_row_to_a_prompt() {
         let mut app = test_app();
-        assert!(status_row(&mut app).contains("s group"));
+        assert!(status_row(&mut app).contains("g group"));
 
         app.mode = Mode::Filter;
         app.filter = "doordash".into();
         let row = status_row(&mut app);
         assert!(row.starts_with("filter: doordash"));
-        assert!(!row.contains("s group"), "prompt owns the row: {row:?}");
+        assert!(!row.contains("g group"), "prompt owns the row: {row:?}");
     }
 
     #[test]
