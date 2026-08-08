@@ -173,6 +173,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|m| {
             let date = m.date.map(fmt_date).unwrap_or_else(|| "          ".into());
+            // recent mail is what you still have context on, so it reads
+            // heavier than the archaeology below it
+            let date_style = if m.date.is_some_and(is_recent) {
+                Style::default().fg(Color::DarkGray).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             let dot = if m.unread { "●" } else { " " };
             let style = if m.unread {
                 Style::default().bold()
@@ -180,7 +187,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(date, Style::default().fg(Color::DarkGray)),
+                Span::styled(date, date_style),
                 Span::raw(" "),
                 Span::styled(dot, Style::default().fg(Color::Cyan)),
                 Span::raw(" "),
@@ -259,6 +266,14 @@ fn fmt_date(d: DateTime<Utc>) -> String {
     }
 }
 
+const RECENT_DAYS: i64 = 30;
+
+/// received within the last 30 days. A date in the future (clock skew on the
+/// sending side) counts as recent rather than ancient.
+fn is_recent(d: DateTime<Utc>) -> bool {
+    Utc::now().signed_duration_since(d) < chrono::Duration::days(RECENT_DAYS)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -273,6 +288,7 @@ mod tests {
     use super::*;
     use crate::action_log::ActionLog;
     use crate::config::AccountConfig;
+    use crate::stacks::{GroupBy, MsgMeta, SortBy, build_stacks};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -296,10 +312,74 @@ mod tests {
             imap_host: "imap".into(),
             smtp_host: "smtp".into(),
         };
-        App::new(vec![cfg], ActionLog::at(std::env::temp_dir().join(format!(
-            "mailprune-view-{}.jsonl",
-            std::process::id()
-        ))))
+        App::new(
+            vec![cfg],
+            ActionLog::at(
+                std::env::temp_dir().join(format!("mailprune-view-{}.jsonl", std::process::id())),
+            ),
+        )
+    }
+
+    /// the style of each cell in the detail-pane row holding `subject`
+    fn detail_row_styles(app: &mut App, subject: &str) -> Vec<Style> {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // the detail pane starts at 45% of a 100-column frame, plus its border
+        let x0 = 46;
+        for y in 0..buf.area.height {
+            let text: String = (x0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if text.contains(subject) {
+                return (x0..buf.area.width).map(|x| buf[(x, y)].style()).collect();
+            }
+        }
+        panic!("no detail row for {subject:?} in\n{buf:?}");
+    }
+
+    /// app holding one stack, its messages given as (subject, date)
+    fn app_with_msgs(msgs: Vec<(&str, DateTime<Utc>)>) -> App {
+        let mut app = test_app();
+        let msgs: Vec<MsgMeta> = msgs
+            .into_iter()
+            .map(|(subject, date)| MsgMeta {
+                uid: 1,
+                sender_email: "a@x.com".into(),
+                sender_name: "A".into(),
+                subject: subject.into(),
+                date: Some(date),
+                unread: false,
+                list_unsubscribe: None,
+                one_click: false,
+            })
+            .collect();
+        app.accounts[0].stacks = build_stacks(msgs, GroupBy::Sender, SortBy::Count);
+        app.accounts[0].loaded = true;
+        app
+    }
+
+    #[test]
+    fn dates_are_bold_only_within_the_last_30_days() {
+        let now = Utc::now();
+        // a day either side of the cutoff, so the boundary itself is covered
+        let inside = now - chrono::Duration::days(RECENT_DAYS - 1);
+        let outside = now - chrono::Duration::days(RECENT_DAYS + 1);
+        let mut app = app_with_msgs(vec![("recent", inside), ("old", outside)]);
+
+        let recent = detail_row_styles(&mut app, "recent");
+        let old = detail_row_styles(&mut app, "old");
+        // the date occupies the first 10 cells of each row
+        assert!(
+            recent[..10]
+                .iter()
+                .all(|s| s.add_modifier.contains(Modifier::BOLD)),
+            "date inside the 30-day window should be bold"
+        );
+        assert!(
+            old[..10]
+                .iter()
+                .all(|s| !s.add_modifier.contains(Modifier::BOLD)),
+            "date outside the 30-day window should not be bold"
+        );
     }
 
     #[test]

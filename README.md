@@ -92,6 +92,7 @@ The fastest way to inbox zero:
 
 ## Notes
 
+- Inside an expanded stack, dates within the last 30 days are bold — recent mail separates from the backlog at a glance.
 - Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
 - Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.
