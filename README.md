@@ -4,6 +4,18 @@ Email triage TUI. Stacks your inbox by sender so you can trash, archive,
 mark-read, or **unsubscribe** from hundreds of emails in a few keystrokes. Built for
 fast inbox-zero over Gmail IMAP, multi-account.
 
+## The kill-loop
+
+The fastest way to inbox zero:
+
+1. `s` — sort by read rate. Stacks you never open float to the top.
+2. `Space` down the list to mark the dead newsletters (auto-advances).
+3. `u` — bulk unsubscribe everything marked, one confirm.
+4. `y` again at the "also trash?" prompt.
+5. `g` to regroup by sender+subject and repeat for noisy notification types
+   from senders you otherwise keep.
+6. `m` when the pane runs dry, and go again.
+
 ```
  mailprune  personal  work                          12 trashed · 40 archived · 3 unsubbed
 ┌ stacks (42) · 873 of 137,482 msgs · by sender · sort read rate · 2 marked ┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
@@ -16,25 +28,12 @@ fast inbox-zero over Gmail IMAP, multi-account.
  j/k move  Space mark  d trash  e archive  r read  u unsub  / filter  ? keys
 ```
 
-Needs a terminal of at least 80x24; below that mailprune asks you to resize rather than drawing a squeezed layout.
-
-## How loading works
-
-mailprune never downloads your whole mailbox. On start it takes one cheap list
-of message IDs (a few hundred KB even at 100k messages), reads the newest
-headers until it has found **40 senders**, then asks the server for every
-message each of those senders has in your inbox. Stacks appear as each sender
-resolves, usually within a second.
-
-So the *set* of stacks on screen is a recent-senders window — but every **count
-is the sender's true inbox-wide total**, and `d` really does trash all of it,
-including messages that were never on screen. The pane title shows both numbers
-(`873 of 137,482`), and both fall as you triage.
-
-Press `m` for the next 40 senders. Loading is always explicit: the pane drains
-as you clear it and refills only when you ask. A count prefixed with `~` means
-the server refused part of that sender's listing, so the count is short and
-trashing the stack will under-clear — press `R` to reload.
+The stacks on screen are the 40 most recent senders, not your whole mailbox —
+press `m` for the next 40. But each **count is every message that sender has in
+your inbox**, not just the ones listed, so `d` trashes all of them. A count
+shown as `~214` means the server refused part of the listing: the sender has
+more than that, mailprune only has 214, and `d` will clear only those. Press
+`R` to reload.
 
 ## Install
 
@@ -80,52 +79,16 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 
 4. **Run**: `mailprune` (TUI) or `mailprune stacks` (headless dump of all accounts).
 
-## Keys
-
-| key | action |
-| --- | --- |
-| `j` / `k` | move selection |
-| `Esc` | clear marks, else clear the filter |
-| `d` | trash entire stack (moves to Gmail Trash — recoverable 30 days) |
-| `e` | archive stack (moves to All Mail) |
-| `r` | mark stack read |
-| `u` | unsubscribe — RFC 8058 one-click POST → mailto via SMTP → browser fallback; then offers to trash the stack |
-| `Space` | mark stack for bulk action (auto-advances; `d`/`e`/`r`/`u` then apply to all marked) |
-| `a` | mark all visible stacks (again to clear) |
-| `m` | load 40 more senders, appended to the end |
-| `g` | toggle **g**rouping: sender (default) ↔ sender+subject |
-| `s` | toggle **s**ort: count (default) ↔ read rate (least-read first — your dead newsletters), re-sorting everything loaded |
-| `/` | filter stacks by sender |
-| `Tab` | next account |
-| `R` | reload from scratch — new message list, stacks cleared |
-| `Home` / `End` | top / bottom (`G` also jumps to the bottom) |
-| `?` | full key overlay (any key closes) |
-| `q` | quit |
-
-## The kill-loop
-
-The fastest way to inbox zero:
-
-1. `s` — sort by read rate. Stacks you never open float to the top.
-2. `Space` down the list to mark the dead newsletters (auto-advances).
-3. `u` — bulk unsubscribe everything marked, one confirm.
-4. `y` again at the "also trash?" prompt.
-5. `g` to regroup by sender+subject and repeat for noisy notification types
-   from senders you otherwise keep.
-6. `m` when the pane runs dry, and go again.
-
 ## Notes
 
-- A stack is a set of messages, not a Gmail conversation. Under `g`
-  (sender+subject) the key normalizes `Re:`/`Fwd:` and digit runs, so
-  `Order #123 shipped` and `Order #456 shipped` land together — that is the
-  point for newsletters. Either way `d` trashes only the *inbox* copies: if you
-  ever replied, your Sent copy keeps the Gmail conversation alive. Newsletters
-  have no replies, so this never bites in the case mailprune is built for.
-- In the messages pane, dates within the last 30 days are bold — recent mail separates from the backlog at a glance.
-- Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
-- Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
-- Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.
-- Passwords live in the Keychain under service `mailprune`. Env override: `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>`.
-- mailprune logs your triage decisions (header metadata only — sender, subject, counts; never message bodies) to `~/.local/state/mailprune/actions.jsonl`. The log stays on your machine and will power future "suggest stacks to act on" features. Disable with `action_log = false` in config.toml; delete the file anytime.
-- Network operations also leave start/done lines in `~/.local/state/mailprune/debug.log` (rotated at 2 MB) — if the TUI ever hangs, the last line names the operation that never returned. Disable with `MAILPRUNE_NO_DEBUG_LOG=1`.
+- **Nothing is ever deleted permanently.** `d` moves mail to Gmail Trash, which
+  Gmail keeps for 30 days. That's the undo story.
+- The read-rate % is the share of a stack's messages you've opened, red when
+  ≈0. A 0% stack with 100 messages is a newsletter you should unsubscribe from.
+- `u` tries RFC 8058 one-click POST first, then `mailto:` (sends a real email
+  via SMTP from your account), then opens the `https` link in your browser.
+- mailprune writes a local log of your triage decisions — header metadata only,
+  never message bodies — to `~/.local/state/mailprune/actions.jsonl`, for
+  future "suggest stacks to act on" features. Disable with `action_log = false`
+  in config.toml. Network activity is logged to `debug.log` alongside it;
+  disable with `MAILPRUNE_NO_DEBUG_LOG=1`.
