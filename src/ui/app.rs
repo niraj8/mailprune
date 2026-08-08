@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::action_log::{Action, ActionLog, StackSnapshot};
 use crate::config::AccountConfig;
 use crate::imap_client::ImapClient;
-use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
+use crate::stacks::{GroupBy, MsgMeta, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -100,6 +100,15 @@ pub enum TaskDone {
         failed: usize,
         last: String,
     },
+    /// an inbox fetch finished for `acct_idx`
+    Load {
+        acct_idx: usize,
+        /// None when the session is unusable (connect or fetch failed)
+        client: Option<Box<ImapClient>>,
+        /// the keychain lookup's result, cached so later loads skip it
+        password: Option<String>,
+        result: Result<Vec<MsgMeta>>,
+    },
 }
 
 pub struct AccountView {
@@ -170,6 +179,12 @@ pub struct App {
     pub filter: String,
     pub status: String,
     pub busy: bool,
+    /// frame counter for the status-bar spinner, advanced by the event loop's
+    /// ticker while `busy`
+    pub spinner: usize,
+    /// the in-flight task is a read-only inbox fetch, so quitting can abandon
+    /// it — unlike a mutation, it has no outcome to log
+    pub loading: bool,
     pub should_quit: bool,
     pub stats: SessionStats,
     pub log: ActionLog,
@@ -189,6 +204,8 @@ impl App {
             filter: String::new(),
             status: String::from("loading…"),
             busy: false,
+            spinner: 0,
+            loading: false,
             should_quit: false,
             stats: SessionStats::default(),
             log,
@@ -317,51 +334,112 @@ impl App {
         }
     }
 
-    pub async fn load_active(&mut self) -> Result<()> {
-        let active = self.active;
-        let acct = &mut self.accounts[active];
-        if acct.password.is_none() {
-            acct.password = Some(crate::config::get_password(&acct.cfg.email)?);
-        }
-        if acct.client.is_none() {
-            self.status = format!("connecting to {}…", acct.cfg.email);
-            let client = ImapClient::connect(&acct.cfg, acct.password.as_deref().unwrap()).await?;
-            acct.client = Some(client);
-        }
-        self.status = format!("fetching inbox for {}…", acct.cfg.email);
-        let group_by = self.group_by;
-        let sort_by = self.sort_by;
-        let acct = &mut self.accounts[active];
-        let msgs = acct.client.as_mut().unwrap().fetch_inbox().await?;
-        let n = msgs.len();
-        acct.stacks = build_stacks(msgs, group_by, sort_by);
-        acct.selected = acct.selected.min(acct.stacks.len().saturating_sub(1));
-        acct.expanded = false;
-        acct.msg_selected = 0;
-        acct.marked.clear();
-        acct.loaded = true;
-        self.status = format!(
+    /// status line describing an account's stacks as they stand now
+    fn account_summary(&self, idx: usize) -> String {
+        let acct = &self.accounts[idx];
+        format!(
             "{}: {} messages in {} stacks",
             acct.cfg.email,
-            n,
+            acct.total_messages(),
             acct.stacks.len()
-        );
-        Ok(())
+        )
     }
 
-    pub async fn handle_event(&mut self, ev: Event) {
+    /// connect (if needed) and fetch the active account's inbox in a background
+    /// task, so the event loop keeps drawing — a cold fetch can take minutes
+    pub fn spawn_load(&mut self) {
+        let acct_idx = self.active;
+        let acct = &mut self.accounts[acct_idx];
+        let cfg = acct.cfg.clone();
+        let cached_password = acct.password.clone();
+        // a live session is reused on refresh; taking it keeps the account from
+        // being used by two paths at once
+        let existing = acct.client.take();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.task_rx = Some(rx);
+        self.busy = true;
+        self.loading = true;
+        self.status = if existing.is_some() {
+            format!("fetching inbox for {}…", cfg.email)
+        } else {
+            format!("connecting to {}…", cfg.email)
+        };
+        tokio::spawn(async move {
+            // handed back in the Done message so later loads and the
+            // unsubscribe path skip the keychain
+            let mut resolved = cached_password;
+            let mut client = match existing {
+                Some(c) => c,
+                None => {
+                    // the keychain read is sync and can take seconds on first
+                    // unlock, so it stays off the event loop with everything
+                    // else in this task
+                    let password = match resolved.clone() {
+                        Some(p) => p,
+                        None => {
+                            let email = cfg.email.clone();
+                            let looked_up = tokio::task::spawn_blocking(move || {
+                                crate::config::get_password(&email)
+                            })
+                            .await;
+                            match looked_up.map_err(anyhow::Error::from).and_then(|r| r) {
+                                Ok(p) => {
+                                    resolved = Some(p.clone());
+                                    p
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+                                        acct_idx,
+                                        client: None,
+                                        password: None,
+                                        result: Err(e),
+                                    }));
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    match ImapClient::connect(&cfg, &password).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+                                acct_idx,
+                                client: None,
+                                password: resolved,
+                                result: Err(e),
+                            }));
+                            return;
+                        }
+                    }
+                }
+            };
+            let _ = tx.send(TaskMsg::Status(format!("fetching inbox for {}…", cfg.email)));
+            let result = client.fetch_inbox().await;
+            // session state is unknown after a failure/timeout: drop the client
+            // so the next refresh reconnects fresh
+            let client = result.is_ok().then(|| Box::new(client));
+            let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+                acct_idx,
+                client,
+                password: resolved,
+                result,
+            }));
+        });
+    }
+
+    pub fn handle_event(&mut self, ev: Event) {
         let Event::Key(key) = ev else { return };
         if key.kind != crossterm::event::KeyEventKind::Press {
             return;
         }
         match self.mode {
-            Mode::Normal => self.handle_normal(key).await,
+            Mode::Normal => self.handle_normal(key),
             Mode::Confirm(_) => self.handle_confirm(key),
             Mode::Filter => self.handle_filter(key),
         }
     }
 
-    async fn handle_normal(&mut self, key: KeyEvent) {
+    fn handle_normal(&mut self, key: KeyEvent) {
         // while an action task is in flight, only allow keys that can't
         // mutate or reorder stacks — the task holds indices into them
         if self.busy {
@@ -379,6 +457,8 @@ impl App {
                     | (KeyCode::Esc, _)
             );
             if !allowed {
+                // silently dropping the key looks like a hung TUI
+                self.status = "busy — wait for the current action to finish".into();
                 return;
             }
         }
@@ -451,11 +531,15 @@ impl App {
             (KeyCode::Tab, _) => {
                 self.active = (self.active + 1) % self.accounts.len();
                 self.filter.clear();
-                if !self.account().loaded {
-                    self.run_load().await;
+                if self.account().loaded {
+                    // the status line is global: without this it keeps
+                    // describing the account we just left
+                    self.status = self.account_summary(self.active);
+                } else {
+                    self.spawn_load();
                 }
             }
-            (KeyCode::Char('R'), _) => self.run_load().await,
+            (KeyCode::Char('R'), _) => self.spawn_load(),
             (KeyCode::Char('s'), _) => self.regroup(self.group_by.toggle()),
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::Filter;
@@ -557,16 +641,6 @@ impl App {
         } else {
             acct.selected = pos.min(visible.len().saturating_sub(1));
         }
-    }
-
-    async fn run_load(&mut self) {
-        self.busy = true;
-        if let Err(e) = self.load_active().await {
-            self.status = format!("error: {e:#}");
-            // drop a possibly-broken session so next attempt reconnects
-            self.account_mut().client = None;
-        }
-        self.busy = false;
     }
 
     /// dispatch a confirmed action to a background task so the event loop
@@ -675,6 +749,7 @@ impl App {
     /// apply a finished task's outcome to app state (runs on the event loop)
     pub fn on_task_done(&mut self, done: TaskDone) {
         self.busy = false;
+        self.loading = false;
         self.task_rx = None;
         match done {
             TaskDone::Imap {
@@ -746,7 +821,40 @@ impl App {
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
                 }
             }
+            TaskDone::Load {
+                acct_idx,
+                client,
+                password,
+                result,
+            } => {
+                let group_by = self.group_by;
+                let sort_by = self.sort_by;
+                let acct = &mut self.accounts[acct_idx];
+                acct.client = client.map(|c| *c);
+                if password.is_some() {
+                    acct.password = password;
+                }
+                match result {
+                    Ok(msgs) => {
+                        acct.stacks = build_stacks(msgs, group_by, sort_by);
+                        acct.selected = acct.selected.min(acct.stacks.len().saturating_sub(1));
+                        acct.expanded = false;
+                        acct.msg_selected = 0;
+                        acct.marked.clear();
+                        acct.loaded = true;
+                        // `seen` is kept: a refresh keeps the current grouping,
+                        // so its snapshots still describe the same stacks
+                        self.status = self.account_summary(acct_idx);
+                    }
+                    Err(e) => self.status = format!("error: {e:#}"),
+                }
+            }
         }
+    }
+
+    /// advance the status-bar spinner one frame
+    pub fn tick_spinner(&mut self) {
+        self.spinner = self.spinner.wrapping_add(1);
     }
 
     /// merged uids across stacks + a human label for the status line
@@ -935,6 +1043,90 @@ mod tests {
         assert_eq!(recs.len(), 1); // only the successful unsub is logged
         assert_eq!(recs[0]["action"], "unsub");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_done_populates_stacks_and_clears_busy() {
+        let path = temp_log("load-ok");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].stacks.clear();
+        app.accounts[0].loaded = false;
+        app.busy = true;
+        app.on_task_done(TaskDone::Load {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            result: Ok(test_msgs()),
+        });
+        assert!(!app.busy);
+        assert!(app.task_rx.is_none());
+        assert!(app.accounts[0].loaded);
+        assert_eq!(app.accounts[0].stacks.len(), 2); // one per sender
+        assert!(app.status.contains("4 messages"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_error_clears_busy_and_drops_client() {
+        let path = temp_log("load-err");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.busy = true;
+        app.on_task_done(TaskDone::Load {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            result: Err(anyhow::anyhow!("boom")),
+        });
+        assert!(!app.busy);
+        assert!(app.accounts[0].client.is_none());
+        assert!(app.status.starts_with("error:"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn spinner_advances_a_frame_at_a_time() {
+        let path = temp_log("spinner");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let before = app.spinner;
+        app.tick_spinner();
+        assert_eq!(app.spinner, before + 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the status line is shared by every account, so switching to one that
+    /// needs no fetch must still rewrite it
+    #[test]
+    fn tab_to_a_loaded_account_restates_its_summary() {
+        let path = temp_log("tab-status");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let mut second = AccountView::new(AccountConfig {
+            name: "other".into(),
+            email: "other@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        });
+        second.stacks = build_stacks(vec![msg(9, "c@x.com", "hi")], GroupBy::Sender, SortBy::Count);
+        second.loaded = true;
+        app.accounts.push(second);
+        app.status = "me@x.com: 4 messages in 2 stacks".into();
+
+        app.handle_normal(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.active, 1);
+        assert_eq!(app.status, "other@x.com: 1 messages in 1 stacks");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a dropped keypress with no feedback reads as a hung TUI
+    #[test]
+    fn mutating_keys_while_busy_say_why() {
+        let path = temp_log("busy-key");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.busy = true;
+        app.handle_normal(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal), "no confirm prompt opened");
+        assert!(app.status.contains("busy"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

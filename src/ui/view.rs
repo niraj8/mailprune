@@ -206,25 +206,35 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// braille spinner, one frame per event-loop tick while busy
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let (text, style) = match &app.mode {
-        Mode::Confirm(action) => (
+    let line = match &app.mode {
+        Mode::Confirm(action) => Line::from(Span::styled(
             action.prompt(app.account()),
             Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
-        ),
-        Mode::Filter => (
+        )),
+        Mode::Filter => Line::from(Span::styled(
             format!("filter: {}▏", app.filter),
             Style::default().fg(Color::Cyan),
-        ),
+        )),
         Mode::Normal => {
-            let prefix = if app.busy { "⏳ " } else { "" };
-            (
-                format!("{prefix}{}", app.status),
+            let mut spans = Vec::new();
+            if app.busy {
+                spans.push(Span::styled(
+                    format!("{} ", SPINNER[app.spinner % SPINNER.len()]),
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
+            }
+            spans.push(Span::styled(
+                app.status.clone(),
                 Style::default().fg(Color::Gray),
-            )
+            ));
+            Line::from(spans)
         }
     };
-    frame.render_widget(Paragraph::new(text).style(style), area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
@@ -255,5 +265,57 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action_log::ActionLog;
+    use crate::config::AccountConfig;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// the status row of a rendered frame, trailing blanks trimmed
+    fn status_row(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row = buf.area.height - 2; // status sits above the help row
+        (0..buf.area.width)
+            .map(|x| buf[(x, row)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn test_app() -> App {
+        let cfg = AccountConfig {
+            name: "t".into(),
+            email: "me@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        };
+        App::new(vec![cfg], ActionLog::at(std::env::temp_dir().join(format!(
+            "mailprune-view-{}.jsonl",
+            std::process::id()
+        ))))
+    }
+
+    #[test]
+    fn busy_status_shows_a_spinner_that_advances() {
+        let mut app = test_app();
+        app.status = "fetching inbox…".into();
+
+        assert_eq!(status_row(&mut app), "fetching inbox…", "idle: no spinner");
+
+        app.busy = true;
+        let first = status_row(&mut app);
+        app.tick_spinner();
+        let second = status_row(&mut app);
+
+        assert!(first.ends_with("fetching inbox…"));
+        assert!(SPINNER.contains(&&first[..first.len() - "fetching inbox…".len() - 1]));
+        assert_ne!(first, second, "spinner frame advances with the tick");
     }
 }

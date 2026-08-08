@@ -104,11 +104,12 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) -> Result<()> {
     // draw the loading frame before the first (slow) fetch
     terminal.draw(|f| ui::view::draw(f, app))?;
-    if let Err(e) = app.load_active().await {
-        app.status = format!("error: {e:#}");
-    }
+    app.spawn_load();
 
     let mut events = EventStream::new();
+    // drives the spinner; only polled while an action is in flight
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         terminal.draw(|f| ui::view::draw(f, app))?;
         if app.should_quit {
@@ -116,22 +117,26 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
             // what gets logged, and quitting first would both abandon the
             // IMAP move mid-flight and mislabel the stack as "keep".
             // Bounded by the client's own operation timeouts.
-            let Some(mut rx) = app.task_rx.take() else {
+            // a fetch is read-only: nothing to log, nothing left half-done, so
+            // quitting mid-load exits now instead of waiting out the fetch
+            let Some(mut rx) = app.task_rx.take().filter(|_| !app.loading) else {
                 break;
             };
             app.status = "finishing action before exit…".into();
             terminal.draw(|f| ui::view::draw(f, app))?;
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    ui::app::TaskMsg::Status(s) => {
-                        app.status = s;
-                        terminal.draw(|f| ui::view::draw(f, app))?;
-                    }
-                    ui::app::TaskMsg::Done(done) => {
-                        app.on_task_done(done);
-                        break;
-                    }
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(ui::app::TaskMsg::Status(s)) => app.status = s,
+                        Some(ui::app::TaskMsg::Done(done)) => {
+                            app.on_task_done(done);
+                            break;
+                        }
+                        None => break,
+                    },
+                    _ = ticker.tick() => app.tick_spinner(),
                 }
+                terminal.draw(|f| ui::view::draw(f, app))?;
             }
             break;
         }
@@ -142,10 +147,14 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
                 ev = events.next() => {
                     app.task_rx = Some(rx);
                     match ev {
-                        Some(Ok(ev)) => app.handle_event(ev).await,
+                        Some(Ok(ev)) => app.handle_event(ev),
                         Some(Err(_)) => {}
                         None => break,
                     }
+                }
+                _ = ticker.tick(), if app.busy => {
+                    app.task_rx = Some(rx);
+                    app.tick_spinner();
                 }
                 msg = rx.recv() => match msg {
                     Some(ui::app::TaskMsg::Status(s)) => {
@@ -161,10 +170,15 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
                 },
             }
         } else {
-            match events.next().await {
-                Some(Ok(ev)) => app.handle_event(ev).await,
-                Some(Err(_)) => {}
-                None => break,
+            // no task in flight, so `busy` should be false and the ticker arm
+            // disabled — kept so the spinner can never freeze mid-animation
+            tokio::select! {
+                ev = events.next() => match ev {
+                    Some(Ok(ev)) => app.handle_event(ev),
+                    Some(Err(_)) => {}
+                    None => break,
+                },
+                _ = ticker.tick(), if app.busy => app.tick_spinner(),
             }
         }
     }
