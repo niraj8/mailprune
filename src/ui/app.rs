@@ -547,8 +547,8 @@ impl App {
                 "finding senders for {}…",
                 cfg.email
             )));
-            let (cursor, result) = client
-                .load_batch(&uids, cursor, &known, |batch| {
+            let (cursor, result) =
+                imap_client::load_batch(&mut client, &uids, cursor, &known, |batch| {
                     let _ = tx.send(TaskMsg::Sender {
                         acct_idx,
                         batch: Box::new(batch),

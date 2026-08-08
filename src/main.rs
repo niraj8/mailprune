@@ -206,14 +206,19 @@ async fn cli_stacks() -> Result<()> {
         let uids = client.uid_list().await?;
         let mut msgs = Vec::new();
         let mut partial = Vec::new();
-        let (_, outcome) = client
-            .load_batch(&uids, 0, &std::collections::HashSet::new(), |batch| {
+        let (_, outcome) = imap_client::load_batch(
+            &mut client,
+            &uids,
+            0,
+            &std::collections::HashSet::new(),
+            |batch| {
                 if batch.partial {
                     partial.push(batch.addr);
                 }
                 msgs.extend(batch.msgs);
-            })
-            .await;
+            },
+        )
+        .await;
         outcome?;
         let total = msgs.len();
         let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
