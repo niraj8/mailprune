@@ -413,7 +413,10 @@ impl App {
                     }
                 }
             };
-            let _ = tx.send(TaskMsg::Status(format!("fetching inbox for {}…", cfg.email)));
+            let _ = tx.send(TaskMsg::Status(format!(
+                "fetching inbox for {}…",
+                cfg.email
+            )));
             let result = client.fetch_inbox().await;
             // session state is unknown after a failure/timeout: drop the client
             // so the next refresh reconnects fresh
@@ -901,6 +904,7 @@ mod tests {
             subject: subject.into(),
             date: None,
             unread: true,
+            has_attachment: false,
             list_unsubscribe: None,
             one_click: false,
         }
@@ -1105,7 +1109,11 @@ mod tests {
             imap_host: "imap".into(),
             smtp_host: "smtp".into(),
         });
-        second.stacks = build_stacks(vec![msg(9, "c@x.com", "hi")], GroupBy::Sender, SortBy::Count);
+        second.stacks = build_stacks(
+            vec![msg(9, "c@x.com", "hi")],
+            GroupBy::Sender,
+            SortBy::Count,
+        );
         second.loaded = true;
         app.accounts.push(second);
         app.status = "me@x.com: 4 messages in 2 stacks".into();

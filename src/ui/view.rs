@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -6,6 +6,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::app::{App, Mode};
+
+/// attachment marker; two cells wide, so the empty slot is two spaces and the
+/// subject column stays aligned
+const CLIP: &str = "📎";
+const CLIP_BLANK: &str = "  ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
@@ -173,16 +178,26 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|m| {
             let date = m.date.map(fmt_date).unwrap_or_else(|| "          ".into());
+            // this month's mail is what you still have context on, so it reads
+            // heavier than the archaeology below it
+            let date_style = if m.date.is_some_and(in_current_month) {
+                Style::default().fg(Color::DarkGray).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             let dot = if m.unread { "●" } else { " " };
+            let clip = if m.has_attachment { CLIP } else { CLIP_BLANK };
             let style = if m.unread {
                 Style::default().bold()
             } else {
                 Style::default().fg(Color::Gray)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(date, Style::default().fg(Color::DarkGray)),
+                Span::styled(date, date_style),
                 Span::raw(" "),
                 Span::styled(dot, Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(clip, Style::default().fg(Color::Yellow)),
                 Span::raw(" "),
                 Span::styled(m.subject.clone(), style),
             ]))
@@ -259,6 +274,13 @@ fn fmt_date(d: DateTime<Utc>) -> String {
     }
 }
 
+/// same calendar month as today, in the viewer's local timezone
+fn in_current_month(d: DateTime<Utc>) -> bool {
+    let local = d.with_timezone(&Local);
+    let now = Local::now();
+    local.year() == now.year() && local.month() == now.month()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -273,8 +295,10 @@ mod tests {
     use super::*;
     use crate::action_log::ActionLog;
     use crate::config::AccountConfig;
+    use crate::stacks::{GroupBy, MsgMeta, SortBy, build_stacks};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     /// the status row of a rendered frame, trailing blanks trimmed
     fn status_row(app: &mut App) -> String {
@@ -296,10 +320,120 @@ mod tests {
             imap_host: "imap".into(),
             smtp_host: "smtp".into(),
         };
-        App::new(vec![cfg], ActionLog::at(std::env::temp_dir().join(format!(
-            "mailprune-view-{}.jsonl",
-            std::process::id()
-        ))))
+        App::new(
+            vec![cfg],
+            ActionLog::at(
+                std::env::temp_dir().join(format!("mailprune-view-{}.jsonl", std::process::id())),
+            ),
+        )
+    }
+
+    /// full rendered frame, wide enough that the detail pane fits a subject
+    fn render(app: &mut App) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// the detail pane row holding `subject`, as (symbol-per-cell, style-per-cell).
+    /// Cells, not bytes: a wide glyph occupies two of them and the subject
+    /// column can only be compared across rows in cell units.
+    fn detail_row(buf: &Buffer, subject: &str) -> (Vec<String>, Vec<Style>) {
+        // the detail pane starts at 45% of a 100-column frame, plus its border
+        let x0 = 46;
+        for y in 0..buf.area.height {
+            let cells: Vec<String> = (x0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if cells.concat().contains(subject) {
+                let styles = (x0..buf.area.width).map(|x| buf[(x, y)].style()).collect();
+                return (cells, styles);
+            }
+        }
+        panic!("no detail row for {subject:?} in\n{buf:?}");
+    }
+
+    /// cell index at which `subject` starts in a row
+    fn subject_col(cells: &[String], subject: &str) -> usize {
+        (0..cells.len())
+            .find(|&i| cells[i..].concat().starts_with(subject))
+            .expect("subject is in this row")
+    }
+
+    /// app with one stack whose messages are (subject, date, has_attachment)
+    fn app_with_msgs(msgs: Vec<(&str, DateTime<Utc>, bool)>) -> App {
+        let mut app = test_app();
+        let msgs: Vec<MsgMeta> = msgs
+            .into_iter()
+            .map(|(subject, date, has_attachment)| MsgMeta {
+                uid: 1,
+                sender_email: "a@x.com".into(),
+                sender_name: "A".into(),
+                subject: subject.into(),
+                date: Some(date),
+                unread: false,
+                has_attachment,
+                list_unsubscribe: None,
+                one_click: false,
+            })
+            .collect();
+        app.accounts[0].stacks = build_stacks(msgs, GroupBy::Sender, SortBy::Count);
+        app.accounts[0].loaded = true;
+        app
+    }
+
+    #[test]
+    fn attachment_marker_shows_only_for_messages_that_have_one() {
+        let day = Utc::now() - chrono::Duration::days(40);
+        let mut app = app_with_msgs(vec![("with", day, true), ("without", day, false)]);
+        let buf = render(&mut app);
+
+        let (with, _) = detail_row(&buf, "with");
+        let (without, _) = detail_row(&buf, "without");
+        assert!(
+            with.iter().any(|c| c == CLIP),
+            "expected a clip in {:?}",
+            with.concat()
+        );
+        assert!(
+            !without.iter().any(|c| c == CLIP),
+            "unexpected clip in {:?}",
+            without.concat()
+        );
+        // the marker is its own column: subjects still start at the same cell
+        assert_eq!(
+            subject_col(&with, "with"),
+            subject_col(&without, "without"),
+            "clip must not shift the subject column"
+        );
+    }
+
+    #[test]
+    fn dates_are_bold_only_for_the_current_month() {
+        // mid-month, so the "this month" case can't straddle a month boundary
+        let this_month = Local::now().with_day(15).unwrap().with_timezone(&Utc);
+        let last_month = this_month - chrono::Duration::days(35);
+        let mut app = app_with_msgs(vec![
+            ("recent", this_month, false),
+            ("old", last_month, false),
+        ]);
+        let buf = render(&mut app);
+
+        let (_, recent) = detail_row(&buf, "recent");
+        let (_, old) = detail_row(&buf, "old");
+        // the date occupies the first 10 cells of each row
+        assert!(
+            recent[..10]
+                .iter()
+                .all(|s| s.add_modifier.contains(Modifier::BOLD)),
+            "current-month date should be bold"
+        );
+        assert!(
+            old[..10]
+                .iter()
+                .all(|s| !s.add_modifier.contains(Modifier::BOLD)),
+            "older date should not be bold"
+        );
     }
 
     #[test]

@@ -171,6 +171,7 @@ mod tests {
                     - chrono::Duration::days(days_ago),
             ),
             unread,
+            has_attachment: false,
             list_unsubscribe: Some("<https://example.com/u>".into()),
             one_click: true,
         }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use async_imap::imap_proto::BodyStructure;
 use chrono::Utc;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -110,7 +111,10 @@ impl ImapClient {
             }
             let mut out = Vec::with_capacity(mailbox.exists as usize);
             let mut stream = session
-                .uid_fetch("1:*", "(UID FLAGS INTERNALDATE RFC822.HEADER)")
+                .uid_fetch(
+                    "1:*",
+                    "(UID FLAGS INTERNALDATE BODYSTRUCTURE RFC822.HEADER)",
+                )
                 .await?;
             while let Some(fetch) = stream.next().await {
                 let fetch = fetch?;
@@ -119,6 +123,7 @@ impl ImapClient {
                     .flags()
                     .any(|f| matches!(f, async_imap::types::Flag::Seen));
                 let date = fetch.internal_date().map(|d| d.with_timezone(&Utc));
+                let has_attachment = fetch.bodystructure().is_some_and(has_attachment);
                 let Some(header_bytes) = fetch.header() else {
                     continue;
                 };
@@ -142,6 +147,7 @@ impl ImapClient {
                     subject,
                     date,
                     unread,
+                    has_attachment,
                     list_unsubscribe,
                     one_click,
                 });
@@ -199,6 +205,26 @@ impl ImapClient {
     }
 }
 
+/// Does any part of the message carry `Content-Disposition: attachment`?
+///
+/// Only that disposition counts. Marketing mail is almost always
+/// multipart/related with inline images, so treating "has a non-text part" as
+/// an attachment would put a paperclip on nearly every stack.
+fn has_attachment(body: &BodyStructure) -> bool {
+    let (common, children) = match body {
+        BodyStructure::Basic { common, .. }
+        | BodyStructure::Text { common, .. }
+        | BodyStructure::Message { common, .. } => (common, None),
+        BodyStructure::Multipart { common, bodies, .. } => (common, Some(bodies)),
+    };
+    if let Some(d) = &common.disposition
+        && d.ty.eq_ignore_ascii_case("attachment")
+    {
+        return true;
+    }
+    children.is_some_and(|bodies| bodies.iter().any(has_attachment))
+}
+
 /// "John Doe <a@b.com>" -> ("John Doe", "a@b.com"); RFC 2047 already decoded by mailparse
 fn parse_from(raw: &str) -> (String, String) {
     if let Ok(list) = mailparse::addrparse(raw) {
@@ -244,7 +270,90 @@ pub fn uid_set(uids: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::uid_set;
+    use super::{has_attachment, uid_set};
+    use async_imap::imap_proto::{
+        BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentDisposition,
+        ContentEncoding, ContentType,
+    };
+
+    /// a leaf part of `ty/subtype`, optionally carrying a disposition
+    fn part<'a>(ty: &'a str, subtype: &'a str, disposition: Option<&'a str>) -> BodyStructure<'a> {
+        BodyStructure::Basic {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: ty.into(),
+                    subtype: subtype.into(),
+                    params: None,
+                },
+                disposition: disposition.map(|ty| ContentDisposition {
+                    ty: ty.into(),
+                    params: None,
+                }),
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::Base64,
+                octets: 100,
+            },
+            extension: None,
+        }
+    }
+
+    fn multipart<'a>(subtype: &'a str, bodies: Vec<BodyStructure<'a>>) -> BodyStructure<'a> {
+        BodyStructure::Multipart {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: "multipart".into(),
+                    subtype: subtype.into(),
+                    params: None,
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            bodies,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn plain_and_inline_only_mail_has_no_attachment() {
+        assert!(!has_attachment(&part("text", "plain", None)));
+        // the newsletter shape: inline images must not trip the indicator
+        assert!(!has_attachment(&multipart(
+            "related",
+            vec![
+                part("text", "html", None),
+                part("image", "png", Some("inline")),
+            ]
+        )));
+    }
+
+    #[test]
+    fn attachment_disposition_is_found_at_any_depth() {
+        assert!(has_attachment(&multipart(
+            "mixed",
+            vec![
+                part("text", "plain", None),
+                part("application", "pdf", Some("attachment")),
+            ]
+        )));
+        // nested multipart/alternative inside multipart/mixed
+        assert!(has_attachment(&multipart(
+            "mixed",
+            vec![
+                multipart(
+                    "alternative",
+                    vec![part("text", "plain", None), part("text", "html", None)]
+                ),
+                multipart("mixed", vec![part("image", "jpeg", Some("ATTACHMENT"))]),
+            ]
+        )));
+    }
 
     #[test]
     fn uid_set_compresses_ranges() {

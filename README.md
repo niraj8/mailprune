@@ -7,9 +7,9 @@ fast inbox-zero over Gmail IMAP, multi-account.
 ```
  mailprune  personal  work
 ┌ stacks (42) · 873 msgs · by sender · sort read rate · 2 marked ─┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
-│▌ 214   0% U DoorDash (12 new)                                   ││ 2026-06-09 ● Your order is on the way                     │
-│▌ 120   2% U Medium Daily Digest                                 ││ 2026-06-08   Craving something new?                       │
-│   76  31% U LinkedIn                                            ││ 2026-06-07   Weekend deals near you                       │
+│▌ 214   0% U DoorDash (12 new)                                   ││ 2026-06-09 ●    Your order is on the way                  │
+│▌ 120   2% U Medium Daily Digest                                 ││ 2026-06-08   📎 Receipt for order #4471                   │
+│   76  31% U LinkedIn                                            ││ 2026-06-07      Weekend deals near you                    │
 │   31  94%   GitHub                                              ││ ...                                                       │
 └─────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
  j/k · Enter expand · Space mark · a mark all · d trash · e archive · r read · u unsub · s group · o sort · / filter · Tab acct · q quit
@@ -92,6 +92,7 @@ The fastest way to inbox zero:
 
 ## Notes
 
+- Inside an expanded stack, `●` marks unread and `📎` marks a message carrying an attachment (`Content-Disposition: attachment` — inline newsletter images don't count). Dates from the current month are bold.
 - Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
 - Unsubscribe priority: `List-Unsubscribe-Post` one-click (silent HTTP POST) → `mailto:` (sends an email via SMTP with your app password) → opening the `https` link in your browser.

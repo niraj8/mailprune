@@ -8,6 +8,7 @@ pub struct MsgMeta {
     pub subject: String,
     pub date: Option<DateTime<Utc>>,
     pub unread: bool,
+    pub has_attachment: bool,
     pub list_unsubscribe: Option<String>,
     pub one_click: bool,
 }
@@ -198,6 +199,7 @@ mod tests {
             subject: "hi".into(),
             date: None,
             unread,
+            has_attachment: false,
             list_unsubscribe: None,
             one_click: false,
         }
