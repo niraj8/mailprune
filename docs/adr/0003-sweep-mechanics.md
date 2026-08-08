@@ -27,7 +27,7 @@ This supersedes ADR 0001's claim that the first stacks land after one round trip
 
 - **Stacks are rebuilt from the accumulated messages when the sweep completes**, through the same `build_stacks` path `g` already uses. Nothing is on screen to sort before then, so chunk arrival order cannot affect the final list. An incremental merge would be a second grouping implementation to keep in sync with the first, for microseconds on a 10,000-message store.
 - **Selection follows the stack it was on, by key**, across the completion sort — it may land anywhere on screen. The user pressed `m` mid-triage with a stack in mind; holding the row index instead retargets the cursor silently, which matters the moment the next key is `d`.
-- **An action removes its messages from the store and rebuilds.** The stack disappears. Leaving the row as a receipt was rejected: the action log was deleted deliberately (#10), and a row whose mail is already gone from the server invites a second `d`.
+- **An action removes its messages from the store and rebuilds.** The stack disappears. Leaving the row as a receipt was rejected: the receipt already exists in the action log, which was kept deliberately (#10 proposed deleting it and was closed not-planned), and a row whose mail is already gone from the server invites a second `d`.
 
 ## Failure
 
