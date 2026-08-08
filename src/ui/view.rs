@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -178,9 +178,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|m| {
             let date = m.date.map(fmt_date).unwrap_or_else(|| "          ".into());
-            // this month's mail is what you still have context on, so it reads
+            // recent mail is what you still have context on, so it reads
             // heavier than the archaeology below it
-            let date_style = if m.date.is_some_and(in_current_month) {
+            let date_style = if m.date.is_some_and(is_recent) {
                 Style::default().fg(Color::DarkGray).bold()
             } else {
                 Style::default().fg(Color::DarkGray)
@@ -274,11 +274,12 @@ fn fmt_date(d: DateTime<Utc>) -> String {
     }
 }
 
-/// same calendar month as today, in the viewer's local timezone
-fn in_current_month(d: DateTime<Utc>) -> bool {
-    let local = d.with_timezone(&Local);
-    let now = Local::now();
-    local.year() == now.year() && local.month() == now.month()
+const RECENT_DAYS: i64 = 30;
+
+/// received within the last 30 days. A date in the future (clock skew on the
+/// sending side) counts as recent rather than ancient.
+fn is_recent(d: DateTime<Utc>) -> bool {
+    Utc::now().signed_duration_since(d) < chrono::Duration::days(RECENT_DAYS)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -409,14 +410,12 @@ mod tests {
     }
 
     #[test]
-    fn dates_are_bold_only_for_the_current_month() {
-        // mid-month, so the "this month" case can't straddle a month boundary
-        let this_month = Local::now().with_day(15).unwrap().with_timezone(&Utc);
-        let last_month = this_month - chrono::Duration::days(35);
-        let mut app = app_with_msgs(vec![
-            ("recent", this_month, false),
-            ("old", last_month, false),
-        ]);
+    fn dates_are_bold_only_within_the_last_30_days() {
+        let now = Utc::now();
+        // a day either side of the cutoff, so the boundary itself is covered
+        let inside = now - chrono::Duration::days(RECENT_DAYS - 1);
+        let outside = now - chrono::Duration::days(RECENT_DAYS + 1);
+        let mut app = app_with_msgs(vec![("recent", inside, false), ("old", outside, false)]);
         let buf = render(&mut app);
 
         let (_, recent) = detail_row(&buf, "recent");
@@ -426,13 +425,13 @@ mod tests {
             recent[..10]
                 .iter()
                 .all(|s| s.add_modifier.contains(Modifier::BOLD)),
-            "current-month date should be bold"
+            "date inside the 30-day window should be bold"
         );
         assert!(
             old[..10]
                 .iter()
                 .all(|s| !s.add_modifier.contains(Modifier::BOLD)),
-            "older date should not be bold"
+            "date outside the 30-day window should not be bold"
         );
     }
 
