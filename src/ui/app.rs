@@ -268,9 +268,7 @@ impl App {
             accounts: accounts.into_iter().map(AccountView::new).collect(),
             active: 0,
             mode: Mode::Normal,
-            // sender+subject splits a sender's notification types apart, which
-            // is what a batch of 20 senders needs to be actionable
-            group_by: GroupBy::SenderSubject,
+            group_by: GroupBy::Sender,
             sort_by: SortBy::Count,
             filter: String::new(),
             status: String::from("loading…"),

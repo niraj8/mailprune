@@ -216,8 +216,7 @@ async fn cli_stacks() -> Result<()> {
             .await;
         outcome?;
         let total = msgs.len();
-        let stacks =
-            stacks::build_stacks(msgs, stacks::GroupBy::SenderSubject, stacks::SortBy::Count);
+        let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
         println!(
             "{total} of {} messages, {} stacks{}\n",
             uids.len(),

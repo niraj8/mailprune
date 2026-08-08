@@ -94,7 +94,7 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 | `Space` | mark stack for bulk action (auto-advances; `d`/`e`/`r`/`u` then apply to all marked) |
 | `a` | mark all visible stacks (again to clear) |
 | `m` | load 20 more senders, appended to the end |
-| `s` | toggle grouping: sender+subject (default) ↔ sender |
+| `s` | toggle grouping: sender (default) ↔ sender+subject |
 | `o` | toggle sort: count (default) ↔ read rate (least-read first — your dead newsletters), re-sorting everything loaded |
 | `/` | filter stacks by sender |
 | `Tab` | next account |
@@ -111,19 +111,18 @@ The fastest way to inbox zero:
 2. `Space` down the list to mark the dead newsletters (auto-advances).
 3. `u` — bulk unsubscribe everything marked, one confirm.
 4. `y` again at the "also trash?" prompt.
-5. `s` to regroup by sender — the default splits each sender into its
-   notification types, so this collapses them back and lets you sweep whole
-   senders in one keystroke.
+5. `s` to regroup by sender+subject and repeat for noisy notification types
+   from senders you otherwise keep.
 6. `m` when the pane runs dry, and go again.
 
 ## Notes
 
-- A stack is a set of messages, not a Gmail conversation. Grouping by
-  sender+subject normalizes `Re:`/`Fwd:` and digit runs, so `Order #123 shipped`
-  and `Order #456 shipped` land together — that is the point for newsletters.
-  It also means `d` trashes only the *inbox* copies: if you ever replied, your
-  Sent copy keeps the Gmail conversation alive. Newsletters have no replies, so
-  this never bites in the case mailprune is built for.
+- A stack is a set of messages, not a Gmail conversation. Under `s`
+  (sender+subject) the key normalizes `Re:`/`Fwd:` and digit runs, so
+  `Order #123 shipped` and `Order #456 shipped` land together — that is the
+  point for newsletters. Either way `d` trashes only the *inbox* copies: if you
+  ever replied, your Sent copy keeps the Gmail conversation alive. Newsletters
+  have no replies, so this never bites in the case mailprune is built for.
 - Inside an expanded stack, dates within the last 30 days are bold — recent mail separates from the backlog at a glance.
 - Each stack shows a read-rate % (share of its messages you've opened), red when ≈0 — a 0% stack with 100 messages is a newsletter you should unsubscribe from. Based on messages currently in INBOX only.
 - Delete is always move-to-Trash, never permanent — Gmail keeps trash 30 days. That's the undo story.
