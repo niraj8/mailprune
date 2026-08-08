@@ -278,6 +278,10 @@ pub struct Sweep {
     pub msgs: Vec<MsgMeta>,
     /// mailbox size, from this sweep's own `EXISTS`
     pub total: usize,
+    /// the sweep got that `EXISTS`. False only when the mailbox never answered
+    /// — a failed connect knows nothing, and must not report an empty mailbox
+    /// as if it had counted one.
+    pub anchored: bool,
     /// what this sweep set out to read: `WINDOW`, or the rest of the mailbox
     /// when that is nearer
     pub bound: usize,
@@ -337,6 +341,7 @@ pub async fn sweep<M: Mailbox>(
     let bound = WINDOW.min(hi);
     let mut window = Sweep {
         total,
+        anchored: true,
         bound,
         reached_end: hi == 0,
         ..Sweep::default()
@@ -554,8 +559,10 @@ mod tests {
         /// keyed by the address inside `FROM "…"`
         searches: HashMap<String, Answer>,
         searched: bool,
-        /// UIDs the server has no header for any more
-        dead: HashSet<u32>,
+        /// UIDs the server answers nothing for: expunged since the `EXISTS`,
+        /// or a header the parser could not use. Their sequence numbers are
+        /// still asked for, which is what the bound counts.
+        silent: HashSet<u32>,
     }
 
     impl FakeMailbox {
@@ -567,7 +574,7 @@ mod tests {
                 ranges: Vec::new(),
                 searches: HashMap::new(),
                 searched: false,
-                dead: HashSet::new(),
+                silent: HashSet::new(),
             }
         }
 
@@ -591,9 +598,9 @@ mod tests {
             self
         }
 
-        /// these uids are gone: they hold a sequence number but return nothing
-        fn dead_uids(mut self, uids: impl IntoIterator<Item = u32>) -> Self {
-            self.dead = uids.into_iter().collect();
+        /// the fetch for these uids comes back with nothing
+        fn silent_uids(mut self, uids: impl IntoIterator<Item = u32>) -> Self {
+            self.silent = uids.into_iter().collect();
             self
         }
 
@@ -629,7 +636,7 @@ mod tests {
             self.next_fetch_answer()?;
             Ok(self.msgs[(lo - 1) as usize..hi as usize]
                 .iter()
-                .filter(|m| !self.dead.contains(&m.uid))
+                .filter(|m| !self.silent.contains(&m.uid))
                 .cloned()
                 .collect())
         }
@@ -659,7 +666,7 @@ mod tests {
             Ok(self
                 .msgs
                 .iter()
-                .filter(|m| uids.contains(&m.uid) && !self.dead.contains(&m.uid))
+                .filter(|m| uids.contains(&m.uid) && !self.silent.contains(&m.uid))
                 .cloned()
                 .collect())
         }
@@ -735,9 +742,9 @@ mod tests {
     /// The bound is a count of UIDs, not of headers returned: a mailbox full of
     /// dead UIDs must not make a sweep run long to fill its quota.
     #[tokio::test]
-    async fn dead_uids_end_the_sweep_at_the_bound_like_any_other() {
-        // every message in the window but the newest 1,000 is gone
-        let mut mailbox = FakeMailbox::of_size(20_000).dead_uids(15_001..=19_000);
+    async fn headers_that_never_arrive_end_the_sweep_at_the_bound_anyway() {
+        // four of the window's five chunks answer with nothing at all
+        let mut mailbox = FakeMailbox::of_size(20_000).silent_uids(15_001..=19_000);
         let (sweep, result, _) = swept(&mut mailbox, 0).await;
 
         assert!(result.is_ok());

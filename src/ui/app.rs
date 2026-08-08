@@ -217,6 +217,12 @@ impl AccountView {
         let mut seen = HashSet::new();
         all.retain(|m| seen.insert(m.uid));
         self.stacks = build_stacks(all, group_by, sort_by);
+        self.clamp_selection();
+    }
+
+    /// keep the selection on a row that exists. #27 replaces this with
+    /// following the selected stack by key across the completion sort.
+    fn clamp_selection(&mut self) {
         if self.selected >= self.stacks.len() {
             self.selected = self.stacks.len().saturating_sub(1);
         }
@@ -334,13 +340,20 @@ impl App {
         }
     }
 
-    /// called by the view with the stack rows actually on screen this frame;
-    /// features are frozen at first sighting
+    /// Called by the view with the stack rows actually on screen this frame.
+    /// Features are frozen at first sighting, except when a widened window has
+    /// grown the stack: `m` folds new messages into stacks already on screen,
+    /// and a "keep" that reported the count from before the widening would
+    /// under-report the mail the user actually decided to keep.
     pub fn record_seen(&mut self, stack_idxs: &[usize]) {
         let acct = self.account_mut();
         for &i in stack_idxs {
             let stack = &acct.stacks[i];
-            if !acct.seen.contains_key(&stack.key) {
+            let grown = acct
+                .seen
+                .get(&stack.key)
+                .is_some_and(|seen| seen.uids.len() < stack.msgs.len());
+            if grown || !acct.seen.contains_key(&stack.key) {
                 let seen = SeenStack {
                     snap: StackSnapshot::of(stack),
                     uids: stack.uids(),
@@ -929,25 +942,28 @@ impl App {
                 if password.is_some() {
                     acct.password = password;
                 }
-                // the window lands either way: a failure does not un-read the
-                // chunks that arrived, and dropping them would make the next
-                // `m` re-read them. A short window is one the sweep stopped
-                // inside, so `back` moves by what was swept, not by the bound.
-                if sweep.total > 0 || result.is_ok() {
+                // A sweep that never reached its `EXISTS` — a failed connect or
+                // keychain read — knows nothing about the mailbox, and must not
+                // overwrite what the last one learned with zeroes.
+                if sweep.anchored {
+                    // the window lands either way: a failure does not un-read
+                    // the chunks that arrived, and dropping them would make the
+                    // next `m` re-read them. A short window is one the sweep
+                    // stopped inside, so `back` moves by what was actually
+                    // swept, not by the bound.
                     acct.total = sweep.total;
-                }
-                acct.back += sweep.swept;
-                acct.reached_end = sweep.reached_end;
-                if sweep.swept > 0 {
+                    acct.back += sweep.swept;
+                    acct.reached_end = sweep.reached_end;
                     acct.loaded = true;
-                    acct.absorb(std::mem::take(&mut sweep.msgs), group_by, sort_by);
+                    if sweep.swept > 0 {
+                        acct.absorb(std::mem::take(&mut sweep.msgs), group_by, sort_by);
+                    }
                     if kind == Load::Reset {
                         acct.selected = 0;
                     }
                 }
                 match result {
                     Ok(()) => {
-                        acct.loaded = true;
                         self.status = self.account_summary(acct_idx);
                     }
                     // the stacks that landed stay on screen: a failure halfway
@@ -955,7 +971,7 @@ impl App {
                     // half that worked. `back` stopped where the sweep did, so
                     // `m` retries the remainder of this window before it
                     // advances (ADR 0003).
-                    Err(e) if sweep.short() && sweep.swept > 0 => {
+                    Err(e) if sweep.short() => {
                         self.status = format!(
                             "sweep stopped at {} of {} — press m to retry ({e:#})",
                             commas(sweep.swept),
@@ -1011,9 +1027,7 @@ impl App {
             acct.stacks.remove(i);
         }
         acct.marked.clear();
-        if acct.selected >= acct.stacks.len() {
-            acct.selected = acct.stacks.len().saturating_sub(1);
-        }
+        acct.clamp_selection();
     }
 }
 
@@ -1069,6 +1083,7 @@ mod tests {
         Box::new(Sweep {
             msgs,
             total,
+            anchored: true,
             bound,
             swept,
             reached_end: swept == total,
@@ -1361,6 +1376,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// a refusal on the very first chunk is still a short window, and the
+    /// count is the thing the user needs told
+    #[test]
+    fn a_window_that_lost_every_chunk_still_reports_how_far_it_got() {
+        let path = temp_log("sweep-none");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].back = 0;
+        app.accounts[0].reached_end = false;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![], 5_000, 5_000, 0),
+            result: Err(anyhow::anyhow!("NO [CANNOT] fetch")),
+        });
+
+        assert_eq!(app.accounts[0].back, 0, "nothing was swept");
+        assert!(
+            app.status.contains("stopped at 0 of 5,000"),
+            "status: {}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `m` grows stacks that are already on screen, so a snapshot taken before
+    /// the widening would log a keep for fewer messages than the user kept
+    #[test]
+    fn a_stack_that_grew_under_a_widened_window_is_re_snapshotted() {
+        let path = temp_log("seen-grew");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        app.record_seen(&[a]);
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(5, "a@x.com", "three")], 9, 1, 1),
+            result: Ok(()),
+        });
+        let a = stack_idx(&app, "a@x.com");
+        app.record_seen(&[a]);
+        app.flush_keeps();
+
+        let recs = read_records(&path);
+        let keep = recs.iter().find(|r| r["sender"] == "a@x.com").unwrap();
+        assert_eq!(keep["action"], "keep");
+        assert_eq!(keep["count"], 3, "the keep counts the widened stack");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_sweep_that_never_started_clears_busy_and_keeps_the_stacks() {
         let path = temp_log("sweep-err");
@@ -1380,8 +1450,13 @@ mod tests {
         assert_eq!(app.accounts[0].stacks.len(), before);
         assert_eq!(
             app.accounts[0].total, 4,
-            "a failed EXISTS does not blank the mailbox total"
+            "a sweep that never anchored does not blank the mailbox total"
         );
+        assert!(
+            app.accounts[0].reached_end,
+            "nor does it claim there is more mailbox behind the window"
+        );
+        assert_eq!(app.accounts[0].back, 4, "nor does it move the window");
         assert!(app.status.starts_with("error:"), "status: {}", app.status);
         let _ = std::fs::remove_file(&path);
     }

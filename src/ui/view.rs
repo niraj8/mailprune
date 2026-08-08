@@ -515,7 +515,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     const _: () = assert!(
         WINDOW == 5000,
-        "the `m` help row and the README still say 5,000"
+        "the `m` help row says 5,000; the README (#32) still says 40 senders"
     );
     const SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         (
