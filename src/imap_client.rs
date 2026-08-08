@@ -18,7 +18,7 @@ const SEARCH_TIMEOUT_SECS: u64 = 60;
 const FETCH_TIMEOUT_SECS: u64 = 60;
 
 /// senders discovered per batch — one `m` press
-pub const SENDERS_PER_BATCH: usize = 20;
+pub const SENDERS_PER_BATCH: usize = 40;
 /// UIDs discovery may scan before giving up on finding more senders. Counts
 /// UIDs rather than returned headers: after trashing, dead UIDs stay in the
 /// list and return nothing, and the budget must bound those too.
@@ -265,8 +265,8 @@ impl ImapClient {
     /// A server `NO`/`BAD` for one sender yields a partial batch — never a
     /// silent drop, because a sender missing from a triage list is
     /// undetectable. A timeout aborts: the session state is unknown afterwards,
-    /// so the remaining senders would be 19 more commands into a dead socket,
-    /// each waiting out its own timeout.
+    /// so the rest of the batch would be dozens more commands into a dead
+    /// socket, each waiting out its own timeout.
     pub async fn load_batch(
         &mut self,
         uids: &[u32],

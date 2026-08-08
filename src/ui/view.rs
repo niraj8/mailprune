@@ -536,8 +536,8 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 /// makes it a build error rather than a silent drift if the constant moves.
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     const _: () = assert!(
-        SENDERS_PER_BATCH == 20,
-        "the `m` help row and the README still say 20"
+        SENDERS_PER_BATCH == 40,
+        "the `m` help row and the README still say 40"
     );
     const SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         (
@@ -569,7 +569,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         (
             "view",
             &[
-                ("m", "load 20 more senders"),
+                ("m", "load 40 more senders"),
                 ("s", "group by sender / subject"),
                 ("o", "re-sort everything loaded"),
                 ("/", "filter"),

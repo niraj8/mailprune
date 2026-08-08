@@ -22,7 +22,7 @@ Needs a terminal of at least 80x24; below that mailprune asks you to resize rath
 
 mailprune never downloads your whole mailbox. On start it takes one cheap list
 of message IDs (a few hundred KB even at 100k messages), reads the newest
-headers until it has found **20 senders**, then asks the server for every
+headers until it has found **40 senders**, then asks the server for every
 message each of those senders has in your inbox. Stacks appear as each sender
 resolves, usually within a second.
 
@@ -31,7 +31,7 @@ is the sender's true inbox-wide total**, and `d` really does trash all of it,
 including messages that were never on screen. The pane title shows both numbers
 (`873 of 137,482`), and both fall as you triage.
 
-Press `m` for the next 20 senders. Loading is always explicit: the pane drains
+Press `m` for the next 40 senders. Loading is always explicit: the pane drains
 as you clear it and refills only when you ask. A count prefixed with `~` means
 the server refused part of that sender's listing, so the count is short and
 trashing the stack will under-clear — press `R` to reload.
@@ -93,7 +93,7 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 | `u` | unsubscribe — RFC 8058 one-click POST → mailto via SMTP → browser fallback; then offers to trash the stack |
 | `Space` | mark stack for bulk action (auto-advances; `d`/`e`/`r`/`u` then apply to all marked) |
 | `a` | mark all visible stacks (again to clear) |
-| `m` | load 20 more senders, appended to the end |
+| `m` | load 40 more senders, appended to the end |
 | `s` | toggle grouping: sender (default) ↔ sender+subject |
 | `o` | toggle sort: count (default) ↔ read rate (least-read first — your dead newsletters), re-sorting everything loaded |
 | `/` | filter stacks by sender |

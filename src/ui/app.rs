@@ -82,9 +82,9 @@ pub enum TaskMsg {
         acct_idx: usize,
         uids: Vec<u32>,
     },
-    /// one sender resolved. Fan-out is serial on the single session, so
-    /// waiting for the whole batch would be ~2.4s of blank screen; streaming
-    /// puts the first stacks up at ~200ms.
+    /// one sender resolved. Fan-out is serial on the single session — two
+    /// round trips per sender — so waiting for the whole batch would be
+    /// seconds of blank screen; streaming puts the first stacks up at ~200ms.
     Sender {
         acct_idx: usize,
         batch: Box<SenderBatch>,
@@ -158,8 +158,8 @@ pub struct AccountView {
     pub uids: Vec<u32>,
     /// how far discovery has walked `uids`
     pub cursor: usize,
-    /// lowercased addresses already fanned out, so `m` yields 20 senders that
-    /// are new rather than 20 sightings of the ones already on screen
+    /// lowercased addresses already fanned out, so `m` yields a batch of
+    /// senders that are new rather than sightings of the ones on screen
     pub known_senders: HashSet<String>,
     /// senders whose fan-out the server refused: their stacks hold only the
     /// discovery sample, so their counts under-report and are marked `~`
@@ -417,6 +417,7 @@ impl App {
 
     /// `m`: one more batch of senders, appended. The mailbox is never loaded
     /// whole — loading is explicit, and the pane refills only on this key.
+    /// The uid list is untouched, so this is bounded work however big it is.
     fn load_more(&mut self) {
         let acct = self.account();
         if acct.loaded && acct.exhausted() {
@@ -1310,7 +1311,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `m` means one thing: 20 more senders, on the end. It must not reorder
+    /// `m` means one thing: a batch more senders, on the end. It must not reorder
     /// what the user is already looking at.
     #[test]
     fn a_continuation_batch_appends_without_reordering() {
