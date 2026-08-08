@@ -33,5 +33,5 @@ A window smaller than the bound because the sweep that built it failed part-way.
 _Avoid_: Partial, truncated, aborted
 
 **Alert**:
-The centered box that holds anything the user must wait for or answer — a sweep in progress, an action's confirm prompt. One place to look, because during a sweep there is nothing else to look at.
+The centered 60×6 box that holds anything the user must wait for or answer — a sweep in progress, a failed sweep, an action's confirm prompt. Same frame every time; the border colour and the hint line say which. One place to look, because during a sweep there is nothing else to look at.
 _Avoid_: Modal, dialog, popup, toast
