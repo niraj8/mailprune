@@ -117,9 +117,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
             // what gets logged, and quitting first would both abandon the
             // IMAP move mid-flight and mislabel the stack as "keep".
             // Bounded by the client's own operation timeouts.
-            // a fetch is read-only: nothing to log, nothing left half-done, so
-            // quitting mid-load exits now instead of waiting out the fetch
-            let Some(mut rx) = app.task_rx.take().filter(|_| !app.loading) else {
+            // a load is read-only: nothing to log, nothing left half-done, so
+            // it is abandoned rather than waited out
+            app.load_rx = None;
+            app.loading_acct = None;
+            let Some(mut rx) = app.action_rx.take() else {
                 break;
             };
             app.status = "finishing action before exit…".into();
@@ -127,7 +129,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
             loop {
                 tokio::select! {
                     msg = rx.recv() => match msg {
-                        Some(msg) => if !apply(app, msg) { break },
+                        Some(msg) => if !apply(app, msg, Source::Action) { break },
                         None => break,
                     },
                     _ = ticker.tick() => app.tick_spinner(),
@@ -136,56 +138,81 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
             }
             break;
         }
-        // while an action task runs, race its messages against key events so
-        // the UI stays live (progress in the status bar, navigation works)
-        if let Some(mut rx) = app.task_rx.take() {
-            tokio::select! {
-                ev = events.next() => {
-                    app.task_rx = Some(rx);
-                    match ev {
-                        Some(Ok(ev)) => app.handle_event(ev),
-                        Some(Err(_)) => {}
-                        None => break,
-                    }
+        // A load and an action can be in flight at once, so both receivers are
+        // raced against key events — the UI stays live (progress in the status
+        // bar, the whole triage keyboard working) while either runs.
+        let mut load_rx = app.load_rx.take();
+        let mut action_rx = app.action_rx.take();
+        let (mut load_spent, mut action_spent) = (false, false);
+        tokio::select! {
+            ev = events.next() => match ev {
+                Some(Ok(ev)) => app.handle_event(ev),
+                Some(Err(_)) => {}
+                None => break,
+            },
+            // disabled with no task in flight, so the spinner can never freeze
+            // mid-animation
+            _ = ticker.tick(), if app.working() => app.tick_spinner(),
+            msg = recv(&mut load_rx) => match msg {
+                Some(msg) => load_spent = !apply(app, msg, Source::Load),
+                None => {
+                    // task died without reporting (bug); recover the UI
+                    load_spent = true;
+                    app.loading_acct = None;
+                    app.status = "error: load task exited unexpectedly".into();
                 }
-                _ = ticker.tick(), if app.busy => {
-                    app.task_rx = Some(rx);
-                    app.tick_spinner();
+            },
+            msg = recv(&mut action_rx) => match msg {
+                Some(msg) => action_spent = !apply(app, msg, Source::Action),
+                None => {
+                    action_spent = true;
+                    app.busy = false;
+                    app.status = "error: action task exited unexpectedly".into();
                 }
-                msg = rx.recv() => match msg {
-                    Some(msg) => {
-                        if apply(app, msg) {
-                            app.task_rx = Some(rx);
-                        }
-                    }
-                    None => {
-                        // task died without reporting (bug); recover the UI
-                        app.busy = false;
-                        app.status = "error: action task exited unexpectedly".into();
-                    }
-                },
-            }
-        } else {
-            // no task in flight, so `busy` should be false and the ticker arm
-            // disabled — kept so the spinner can never freeze mid-animation
-            tokio::select! {
-                ev = events.next() => match ev {
-                    Some(Ok(ev)) => app.handle_event(ev),
-                    Some(Err(_)) => {}
-                    None => break,
-                },
-                _ = ticker.tick(), if app.busy => app.tick_spinner(),
-            }
+            },
+        }
+        // put back what is still running. A key handled this pass may have
+        // spawned a fresh task into either slot; that one is live and the one
+        // we took out is not, so it keeps the slot.
+        if !load_spent && app.load_rx.is_none() {
+            app.load_rx = load_rx;
+        }
+        if !action_spent && app.action_rx.is_none() {
+            app.action_rx = action_rx;
         }
     }
     Ok(())
 }
 
-/// Apply one message from the in-flight task. Returns whether the task is
+/// Await a receiver that may not exist. A `None` slot never resolves, so the
+/// `select!` arm holding it simply never fires.
+async fn recv(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<ui::app::TaskMsg>>,
+) -> Option<ui::app::TaskMsg> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// which of the two in-flight tasks a message came from
+#[derive(PartialEq)]
+enum Source {
+    Load,
+    Action,
+}
+
+/// Apply one message from an in-flight task. Returns whether that task is
 /// still running — `false` means `Done` landed and the receiver is spent.
-fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
+fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg, from: Source) -> bool {
     match msg {
-        ui::app::TaskMsg::Status(s) => app.status = s,
+        // an action is the thing the user is waiting on, so a load's progress
+        // line does not talk over it
+        ui::app::TaskMsg::Status(s) => {
+            if from == Source::Action || !app.busy {
+                app.status = s;
+            }
+        }
         ui::app::TaskMsg::Uids { acct_idx, uids } => app.on_uids(acct_idx, uids),
         ui::app::TaskMsg::Sender { acct_idx, batch } => app.on_sender(acct_idx, *batch),
         ui::app::TaskMsg::Done(done) => {

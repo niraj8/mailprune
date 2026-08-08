@@ -109,10 +109,13 @@ pub enum Load {
 }
 
 pub enum TaskDone {
-    /// an IMAP mutation finished; the client comes back with it (discarded
-    /// on error — the session state is unknown after a failure/timeout)
+    /// an IMAP mutation finished; the action session comes back with it
+    /// (None when the session is unusable — a connect that failed, or a
+    /// failure/timeout that left the session in an unknown state)
     Imap {
-        client: Box<ImapClient>,
+        client: Option<Box<ImapClient>>,
+        /// the keychain lookup's result, cached so later work skips it
+        password: Option<String>,
         kind: ImapKind,
         stack_idxs: Vec<usize>,
         n_msgs: usize,
@@ -124,6 +127,7 @@ pub enum TaskDone {
         ok_idxs: Vec<usize>,
         failed: usize,
         last: String,
+        password: Option<String>,
     },
     /// a load batch finished for `acct_idx`; its stacks already arrived as
     /// `TaskMsg::Sender`s
@@ -146,7 +150,12 @@ pub enum TaskDone {
 pub struct AccountView {
     pub cfg: AccountConfig,
     pub password: Option<String>,
+    /// the session a load runs on, held for the whole of that load
     pub client: Option<ImapClient>,
+    /// actions run on a session of their own so they never queue behind a
+    /// load, which owns `client` from the moment it starts. Connected on
+    /// first use and kept for the session.
+    pub action_client: Option<ImapClient>,
     pub stacks: Vec<Stack>,
     pub selected: usize,
     pub loaded: bool,
@@ -172,6 +181,28 @@ pub struct AccountView {
     /// uids acted on this session, excluded from "keep" at quit. Keyed by uid
     /// rather than stack key so the exclusion survives regrouping.
     pub acted: HashSet<u32>,
+    /// uids an action removed from INBOX while a load was in flight. The
+    /// load's cursor indexes the list as it was when the load started, so
+    /// these come out only once that cursor has landed.
+    pub pending_prune: HashSet<u32>,
+    /// a completed reset load's sort, waiting on the action task whose
+    /// captured stack indices it would reorder
+    pub pending_sort: bool,
+}
+
+/// The account's password, from the cache if it is there and the keychain if
+/// it is not. Always called from inside a spawned task: the keychain read is
+/// sync and can take seconds on first unlock, so it stays off the event loop
+/// with everything else.
+async fn resolve_password(email: &str, cached: Option<String>) -> Result<String> {
+    if let Some(p) = cached {
+        return Ok(p);
+    }
+    let email = email.to_owned();
+    tokio::task::spawn_blocking(move || crate::config::get_password(&email))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
 }
 
 /// a stack as it was when first rendered
@@ -187,6 +218,7 @@ impl AccountView {
             cfg,
             password: None,
             client: None,
+            action_client: None,
             stacks: Vec::new(),
             selected: 0,
             loaded: false,
@@ -197,6 +229,8 @@ impl AccountView {
             marked: HashSet::new(),
             seen: HashMap::new(),
             acted: HashSet::new(),
+            pending_prune: HashSet::new(),
+            pending_sort: false,
         }
     }
 
@@ -214,6 +248,26 @@ impl AccountView {
     /// no more senders left to discover
     pub fn exhausted(&self) -> bool {
         self.cursor >= self.uids.len()
+    }
+
+    /// Drop uids that have left INBOX from the discovery list. The cursor is
+    /// pulled back by however many of them sat behind it, keeping it over the
+    /// same message — it is an index, so removing entries behind it would
+    /// otherwise slide it forward over senders that were never discovered.
+    fn drop_uids(&mut self, gone: &HashSet<u32>) {
+        let cursor = self.cursor;
+        let mut removed_before = 0;
+        let mut i = 0;
+        // retain visits in order, so `i` tracks the position in the old list
+        self.uids.retain(|uid| {
+            let keep = !gone.contains(uid);
+            if !keep && i < cursor {
+                removed_before += 1;
+            }
+            i += 1;
+            keep
+        });
+        self.cursor = cursor - removed_before;
     }
 
     /// this stack's messages are only the discovery sample — the server
@@ -243,19 +297,26 @@ pub struct App {
     pub sort_by: SortBy,
     pub filter: String,
     pub status: String,
+    /// an action task is in flight. It captured stack indices before it
+    /// started, so mutating keys are blocked until it lands.
     pub busy: bool,
     /// frame counter for the status-bar spinner, advanced by the event loop's
-    /// ticker while `busy`
+    /// ticker while a task runs
     pub spinner: usize,
-    /// the in-flight task is a read-only inbox fetch, so quitting can abandon
-    /// it — unlike a mutation, it has no outcome to log
-    pub loading: bool,
+    /// which account has a load in flight, if any. It only ever appends
+    /// stacks and is read-only besides, so it blocks no keys and quitting can
+    /// abandon it — unlike a mutation, it has no outcome to log. Named by
+    /// account rather than a bare flag because `Tab` is live during a load,
+    /// so the account loading and the account being acted on can differ.
+    pub loading_acct: Option<usize>,
     pub should_quit: bool,
     pub stats: SessionStats,
     pub log: ActionLog,
-    /// receiver for the in-flight action task, if any; while Some, mutating
-    /// keys are blocked so stack indices captured by the task stay valid
-    pub task_rx: Option<mpsc::UnboundedReceiver<TaskMsg>>,
+    /// receiver for the in-flight action task, if any
+    pub action_rx: Option<mpsc::UnboundedReceiver<TaskMsg>>,
+    /// receiver for the in-flight load task, if any. Separate from
+    /// `action_rx` so a load and an action can run at the same time.
+    pub load_rx: Option<mpsc::UnboundedReceiver<TaskMsg>>,
 }
 
 impl App {
@@ -270,16 +331,33 @@ impl App {
             status: String::from("loading…"),
             busy: false,
             spinner: 0,
-            loading: false,
+            loading_acct: None,
             should_quit: false,
             stats: SessionStats::default(),
             log,
-            task_rx: None,
+            action_rx: None,
+            load_rx: None,
         }
     }
 
     pub fn account(&self) -> &AccountView {
         &self.accounts[self.active]
+    }
+
+    /// a load is in flight, on whichever account
+    pub fn loading(&self) -> bool {
+        self.loading_acct.is_some()
+    }
+
+    /// the account on screen is the one being loaded, so an empty pane means
+    /// "not here yet" rather than "nothing to show"
+    pub fn active_is_loading(&self) -> bool {
+        self.loading_acct == Some(self.active)
+    }
+
+    /// some task is in flight, so the spinner has something to say
+    pub fn working(&self) -> bool {
+        self.busy || self.loading()
     }
 
     pub fn account_mut(&mut self) -> &mut AccountView {
@@ -424,6 +502,12 @@ impl App {
     /// connect (if needed) and load one batch of senders in a background task,
     /// so the event loop keeps drawing while the network work runs
     pub fn spawn_batch(&mut self, kind: Load) {
+        // there is one load task slot, and a load owns it and the account's
+        // session for its whole run, so a second one has nothing to run on
+        if self.loading() {
+            self.status = "already loading — wait for this batch".into();
+            return;
+        }
         let acct_idx = self.active;
         // without a uid list there is no cursor to continue from
         let reset = kind == Load::Reset || !self.accounts[acct_idx].loaded;
@@ -450,9 +534,8 @@ impl App {
         let cursor = acct.cursor;
         let known = acct.known_senders.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.task_rx = Some(rx);
-        self.busy = true;
-        self.loading = true;
+        self.load_rx = Some(rx);
+        self.loading_acct = Some(acct_idx);
         self.status = if existing.is_some() {
             format!("finding senders for {}…", cfg.email)
         } else {
@@ -465,34 +548,21 @@ impl App {
             let mut client = match existing {
                 Some(c) => c,
                 None => {
-                    // the keychain read is sync and can take seconds on first
-                    // unlock, so it stays off the event loop with everything
-                    // else in this task
-                    let password = match resolved.clone() {
-                        Some(p) => p,
-                        None => {
-                            let email = cfg.email.clone();
-                            let looked_up = tokio::task::spawn_blocking(move || {
-                                crate::config::get_password(&email)
-                            })
-                            .await;
-                            match looked_up.map_err(anyhow::Error::from).and_then(|r| r) {
-                                Ok(p) => {
-                                    resolved = Some(p.clone());
-                                    p
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
-                                        acct_idx,
-                                        client: None,
-                                        password: None,
-                                        kind,
-                                        cursor,
-                                        result: Err(e),
-                                    }));
-                                    return;
-                                }
-                            }
+                    let password = match resolve_password(&cfg.email, resolved.clone()).await {
+                        Ok(p) => {
+                            resolved = Some(p.clone());
+                            p
+                        }
+                        Err(e) => {
+                            let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
+                                acct_idx,
+                                client: None,
+                                password: None,
+                                kind,
+                                cursor,
+                                result: Err(e),
+                            }));
+                            return;
                         }
                     };
                     match ImapClient::connect(&cfg, &password).await {
@@ -576,8 +646,9 @@ impl App {
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
-        // while an action task is in flight, only allow keys that can't
-        // mutate or reorder stacks — the task holds indices into them
+        // While an action task is in flight, only allow keys that can't mutate
+        // or reorder stacks — the task holds indices into them. A load holds
+        // none, so it locks nothing: `busy` is the action, not the network.
         if self.busy {
             let allowed = matches!(
                 (key.code, key.modifiers),
@@ -770,12 +841,11 @@ impl App {
     fn spawn_imap(&mut self, kind: ImapKind, stack_idxs: Vec<usize>) {
         let (uids, label) = self.collect(&stack_idxs);
         let acct = self.account_mut();
-        let Some(mut client) = acct.client.take() else {
-            self.status = "not connected — press R to reconnect".into();
-            return;
-        };
+        let cfg = acct.cfg.clone();
+        let cached_password = acct.password.clone();
+        let existing = acct.action_client.take();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.task_rx = Some(rx);
+        self.action_rx = Some(rx);
         self.busy = true;
         let verb = match kind {
             ImapKind::Trash => "trashing",
@@ -784,13 +854,44 @@ impl App {
         };
         self.status = format!("{verb} {} messages…", uids.len());
         tokio::spawn(async move {
+            let mut resolved = cached_password;
+            // the first action of the session opens the connection it runs on,
+            // rather than waiting for whatever the load is doing with its own
+            let mut client = match existing {
+                Some(c) => c,
+                None => {
+                    let connected = match resolve_password(&cfg.email, resolved.clone()).await {
+                        Ok(p) => {
+                            resolved = Some(p.clone());
+                            ImapClient::connect(&cfg, &p).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match connected {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(TaskMsg::Done(TaskDone::Imap {
+                                client: None,
+                                password: resolved,
+                                kind,
+                                stack_idxs,
+                                n_msgs: uids.len(),
+                                label,
+                                result: Err(e),
+                            }));
+                            return;
+                        }
+                    }
+                }
+            };
             let result = match kind {
                 ImapKind::Trash => client.trash(&uids).await,
                 ImapKind::Archive => client.archive(&uids).await,
                 ImapKind::Read => client.mark_read(&uids).await,
             };
             let _ = tx.send(TaskMsg::Done(TaskDone::Imap {
-                client: Box::new(client),
+                client: Some(Box::new(client)),
+                password: resolved,
                 kind,
                 stack_idxs,
                 n_msgs: uids.len(),
@@ -803,7 +904,7 @@ impl App {
     fn spawn_unsub(&mut self, stack_idxs: Vec<usize>) {
         let acct = self.account();
         let cfg = acct.cfg.clone();
-        let password = acct.password.clone().unwrap_or_default();
+        let cached_password = acct.password.clone();
         // resolve method + name per stack up front; the stacks stay untouched
         // while the task runs because mutating keys are blocked when busy
         let jobs: Vec<(usize, String, Option<unsubscribe::Method>)> = stack_idxs
@@ -818,10 +919,16 @@ impl App {
             })
             .collect();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.task_rx = Some(rx);
+        self.action_rx = Some(rx);
         self.busy = true;
         self.status = format!("unsubscribing from {} stacks…", jobs.len());
         tokio::spawn(async move {
+            // a mailto unsubscribe is sent over SMTP, so it needs the password
+            // even on the first action of the session, before a load has
+            // cached one. A one-click POST does not, so a keychain failure
+            // here is left to `execute` to report per stack.
+            let resolved = resolve_password(&cfg.email, cached_password).await.ok();
+            let password = resolved.clone().unwrap_or_default();
             let total = jobs.len();
             let mut ok_idxs: Vec<usize> = Vec::new();
             let mut failed = 0;
@@ -854,72 +961,84 @@ impl App {
                 ok_idxs,
                 failed,
                 last,
+                password: resolved,
             }));
         });
     }
 
     /// apply a finished task's outcome to app state (runs on the event loop)
     pub fn on_task_done(&mut self, done: TaskDone) {
-        self.busy = false;
-        self.loading = false;
-        self.task_rx = None;
         match done {
             TaskDone::Imap {
                 client,
+                password,
                 kind,
                 stack_idxs,
                 n_msgs,
                 label,
                 result,
-            } => match result {
-                Ok(()) => {
-                    self.account_mut().client = Some(*client);
-                    match kind {
-                        ImapKind::Trash => {
-                            self.log_action(Action::Trash, &stack_idxs);
-                            self.prune_uids(&stack_idxs);
-                            self.remove_stacks(stack_idxs);
-                            self.stats.trashed += n_msgs;
-                            self.status = format!("trashed {n_msgs} messages from {label}");
-                        }
-                        ImapKind::Archive => {
-                            self.log_action(Action::Archive, &stack_idxs);
-                            self.prune_uids(&stack_idxs);
-                            self.remove_stacks(stack_idxs);
-                            self.stats.archived += n_msgs;
-                            self.status = format!("archived {n_msgs} messages from {label}");
-                        }
-                        ImapKind::Read => {
-                            // snapshot before mutating flags so the log shows
-                            // the read rate the user actually acted on
-                            self.log_action(Action::Read, &stack_idxs);
-                            let acct = self.account_mut();
-                            for &i in &stack_idxs {
-                                for m in &mut acct.stacks[i].msgs {
-                                    m.unread = false;
-                                }
-                                acct.stacks[i].unread_count = 0;
+            } => {
+                self.busy = false;
+                let acct = self.account_mut();
+                if password.is_some() {
+                    acct.password = password;
+                }
+                match result {
+                    Ok(()) => {
+                        self.account_mut().action_client = client.map(|c| *c);
+                        match kind {
+                            ImapKind::Trash => {
+                                self.log_action(Action::Trash, &stack_idxs);
+                                self.prune_uids(&stack_idxs);
+                                self.remove_stacks(stack_idxs);
+                                self.stats.trashed += n_msgs;
+                                self.status = format!("trashed {n_msgs} messages from {label}");
                             }
-                            acct.marked.clear();
-                            self.stats.marked_read += n_msgs;
-                            self.status = format!("marked {n_msgs} messages read ({label})");
+                            ImapKind::Archive => {
+                                self.log_action(Action::Archive, &stack_idxs);
+                                self.prune_uids(&stack_idxs);
+                                self.remove_stacks(stack_idxs);
+                                self.stats.archived += n_msgs;
+                                self.status = format!("archived {n_msgs} messages from {label}");
+                            }
+                            ImapKind::Read => {
+                                // snapshot before mutating flags so the log shows
+                                // the read rate the user actually acted on
+                                self.log_action(Action::Read, &stack_idxs);
+                                let acct = self.account_mut();
+                                for &i in &stack_idxs {
+                                    for m in &mut acct.stacks[i].msgs {
+                                        m.unread = false;
+                                    }
+                                    acct.stacks[i].unread_count = 0;
+                                }
+                                acct.marked.clear();
+                                self.stats.marked_read += n_msgs;
+                                self.status = format!("marked {n_msgs} messages read ({label})");
+                            }
                         }
                     }
+                    Err(e) => {
+                        // session state unknown after failure/timeout: drop the
+                        // client so the next action connects fresh
+                        drop(client);
+                        self.account_mut().action_client = None;
+                        self.status = format!("error: {e:#}");
+                    }
                 }
-                Err(e) => {
-                    // session state unknown after failure/timeout: drop the
-                    // client so the next R reconnects fresh
-                    drop(client);
-                    self.account_mut().client = None;
-                    self.status = format!("error: {e:#}");
-                }
-            },
+                self.apply_deferred_sort();
+            }
             TaskDone::Unsub {
                 stack_idxs,
                 ok_idxs,
                 failed,
                 last,
+                password,
             } => {
+                self.busy = false;
+                if password.is_some() {
+                    self.account_mut().password = password;
+                }
                 let ok = ok_idxs.len();
                 self.status = if stack_idxs.len() == 1 {
                     last
@@ -934,6 +1053,7 @@ impl App {
                     // chain into "also trash?" prompt
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
                 }
+                self.apply_deferred_sort();
             }
             TaskDone::Batch {
                 acct_idx,
@@ -943,7 +1063,9 @@ impl App {
                 cursor,
                 result,
             } => {
-                let sort_by = self.sort_by;
+                self.loading_acct = None;
+                let busy = self.busy;
+                let mut failure = None;
                 let acct = &mut self.accounts[acct_idx];
                 acct.client = client.map(|c| *c);
                 if password.is_some() {
@@ -958,16 +1080,48 @@ impl App {
                         if kind == Load::Reset {
                             // the batch streamed in one sender at a time, so
                             // until now the order is discovery order
-                            sort_stacks(&mut acct.stacks, sort_by);
-                            acct.selected = 0;
+                            acct.pending_sort = true;
                         }
-                        self.status = self.account_summary(acct_idx);
                     }
                     // already-streamed stacks stay on screen: a failure that
                     // arrives halfway through is not a reason to throw away
                     // the half that worked
-                    Err(e) => self.status = format!("error: {e:#}"),
+                    Err(e) => failure = Some(format!("error: {e:#}")),
                 }
+                // now that the cursor the load walked to has landed, uids an
+                // action pruned mid-load can come out of the list it indexes
+                let acct = &mut self.accounts[acct_idx];
+                let pruned = std::mem::take(&mut acct.pending_prune);
+                acct.drop_uids(&pruned);
+                // an action in flight holds indices the sort would reorder, so
+                // it waits — the action's own completion runs it instead
+                if !busy {
+                    self.apply_deferred_sort();
+                }
+                // the action the user is waiting on owns the status line: a
+                // load's summary is not worth talking over it, though a
+                // failure still is
+                if let Some(e) = failure {
+                    self.status = e;
+                } else if !busy {
+                    self.status = self.account_summary(acct_idx);
+                }
+            }
+        }
+    }
+
+    /// Run the sort a reset load put off. Called when nothing holds a stack
+    /// index any more — an action task has landed, or none was running — so
+    /// reordering the list can no longer move a stack out from under one.
+    /// Every account is checked, not just the active one: `Tab` is live
+    /// during a load, so the account that finished loading may not be on
+    /// screen when the action that was blocking its sort completes.
+    fn apply_deferred_sort(&mut self) {
+        let sort_by = self.sort_by;
+        for acct in &mut self.accounts {
+            if std::mem::take(&mut acct.pending_sort) {
+                sort_stacks(&mut acct.stacks, sort_by);
+                acct.selected = 0;
             }
         }
     }
@@ -1017,10 +1171,11 @@ impl App {
         (uids, label)
     }
 
-    /// Drop uids that left INBOX from the discovery list, so a later `m` does
-    /// not spend its scan budget reading a graveyard. The cursor is pulled back
-    /// by however many of them sat behind it, keeping it over the same message.
+    /// Take the acted-on stacks' uids out of the discovery list, so a later
+    /// `m` does not spend its scan budget reading a graveyard — unless the
+    /// account is mid-load, in which case they wait for it.
     fn prune_uids(&mut self, stack_idxs: &[usize]) {
+        let loading = self.active_is_loading();
         let acct = self.account_mut();
         let gone: HashSet<u32> = stack_idxs
             .iter()
@@ -1029,19 +1184,14 @@ impl App {
         if gone.is_empty() {
             return;
         }
-        let cursor = acct.cursor;
-        let mut removed_before = 0;
-        let mut i = 0;
-        // retain visits in order, so `i` tracks the position in the old list
-        acct.uids.retain(|uid| {
-            let keep = !gone.contains(uid);
-            if !keep && i < cursor {
-                removed_before += 1;
-            }
-            i += 1;
-            keep
-        });
-        acct.cursor = cursor - removed_before;
+        if loading {
+            // the in-flight load's cursor counts the list as it stands right
+            // now, so removing from it here would land that cursor over
+            // senders the load never read. It comes out once the cursor does.
+            acct.pending_prune.extend(gone);
+        } else {
+            acct.drop_uids(&gone);
+        }
     }
 
     fn remove_stacks(&mut self, mut stack_idxs: Vec<usize>) {
@@ -1127,6 +1277,14 @@ mod tests {
         path
     }
 
+    fn keys(app: &App) -> Vec<&str> {
+        app.accounts[0]
+            .stacks
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect()
+    }
+
     fn stack_idx(app: &App, key: &str) -> usize {
         app.accounts[0]
             .stacks
@@ -1209,6 +1367,7 @@ mod tests {
             ok_idxs: vec![0],
             failed: 1,
             last: "x".into(),
+            password: None,
         });
         assert!(!app.busy);
         assert_eq!(app.stats.unsubscribed, 1);
@@ -1232,7 +1391,7 @@ mod tests {
         let mut app = test_app(ActionLog::at(path.clone()));
         app.accounts[0].stacks.clear();
         app.accounts[0].loaded = false;
-        app.busy = true;
+        app.loading_acct = Some(0);
 
         app.on_uids(0, vec![4, 3, 2, 1]);
         assert_eq!(app.accounts[0].inbox_total(), 4);
@@ -1256,8 +1415,7 @@ mod tests {
             result: Ok(()),
         });
 
-        assert!(!app.busy);
-        assert!(app.task_rx.is_none());
+        assert!(!app.loading());
         assert!(app.accounts[0].loaded);
         assert_eq!(app.accounts[0].cursor, 4);
         let keys: Vec<&str> = app.accounts[0]
@@ -1333,11 +1491,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_error_clears_busy_and_keeps_what_already_streamed_in() {
+    fn batch_error_clears_loading_and_keeps_what_already_streamed_in() {
         let path = temp_log("load-err");
         let mut app = test_app(ActionLog::at(path.clone()));
         let before = app.accounts[0].stacks.len();
-        app.busy = true;
+        app.loading_acct = Some(0);
         app.on_task_done(TaskDone::Batch {
             acct_idx: 0,
             client: None,
@@ -1346,7 +1504,7 @@ mod tests {
             cursor: 7,
             result: Err(anyhow::anyhow!("boom")),
         });
-        assert!(!app.busy);
+        assert!(!app.loading());
         assert!(app.accounts[0].client.is_none());
         assert_eq!(app.accounts[0].stacks.len(), before);
         // a failure does not un-scan what discovery already read; dropping the
@@ -1379,7 +1537,7 @@ mod tests {
         let path = temp_log("m-exhausted");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.handle_normal(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(app.task_rx.is_none(), "no load was spawned");
+        assert!(!app.loading(), "no load was spawned");
         assert!(app.status.contains("no more senders"), "{}", app.status);
         let _ = std::fs::remove_file(&path);
     }
@@ -1465,6 +1623,213 @@ mod tests {
             "moving the cursor is still allowed"
         );
         assert!(app.status.is_empty(), "{}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A load is not an action, and must not raise the flag the key gate
+    /// reads: doing so puts the whole triage keyboard behind the fetch.
+    #[tokio::test]
+    async fn a_load_in_flight_leaves_the_keyboard_unlocked() {
+        let path = temp_log("load-not-busy");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        // a cached password keeps the spawned task off the keychain; it dies
+        // on the unresolvable host a moment later, unobserved
+        app.accounts[0].password = Some("x".into());
+        app.accounts[0].cursor = 0;
+
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(app.loading(), "the load is in flight");
+        assert!(!app.busy, "and it locks nothing");
+        assert!(app.load_rx.is_some());
+        assert!(app.action_rx.is_none(), "a load is not an action");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a load only ever appends stacks, so it holds no indices for a key to
+    /// invalidate — the whole triage keyboard stays live while it runs
+    #[tokio::test]
+    async fn triage_keys_stay_live_while_the_mailbox_loads() {
+        let path = temp_log("keys-loading");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.loading_acct = Some(0);
+        // as above: a cached password keeps `r`'s task off the keychain
+        app.accounts[0].password = Some("x".into());
+
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(app.mode, Mode::Confirm(PendingAction::Trash { .. })),
+            "trash prompt opened mid-load"
+        );
+        app.mode = Mode::Normal;
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(PendingAction::Archive { .. })
+        ));
+        app.mode = Mode::Normal;
+
+        // g/s/'/' reshape the view rather than the mailbox
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.group_by, GroupBy::SenderSubject, "regroup accepted");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.sort_by, SortBy::ReadRate, "re-sort accepted");
+        press(&mut app, KeyCode::Char('/'));
+        assert!(matches!(app.mode, Mode::Filter), "filter accepted");
+        app.mode = Mode::Normal;
+
+        // these stacks carry no List-Unsubscribe header, so `u` reaching its
+        // own refusal is what proves the gate let it through
+        press(&mut app, KeyCode::Char('u'));
+        assert!(
+            app.status.contains("no List-Unsubscribe"),
+            "status: {}",
+            app.status
+        );
+
+        // `r` needs no confirmation, so it is the one triage key that reaches
+        // the network straight from the gate. It goes last: it is an action,
+        // and an action does lock the keys behind it.
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.busy, "mark-read dispatched mid-load");
+        assert!(app.action_rx.is_some());
+        assert!(app.loading(), "and the load is still going");
+        assert!(!app.status.contains("busy"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `Tab` is live during a load, so the account being acted on need not be
+    /// the one loading. Only the loading account has a cursor mid-walk, so
+    /// only its prune waits — deferring the other's would strand those uids
+    /// until that account happened to load, leaving `exhausted` counting mail
+    /// that is already in the bin.
+    #[test]
+    fn a_trash_on_an_account_that_is_not_loading_prunes_at_once() {
+        let path = temp_log("prune-other-acct");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let mut second = AccountView::new(AccountConfig {
+            name: "other".into(),
+            email: "other@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        });
+        second.stacks = build_stacks(
+            vec![msg(9, "c@x.com", "hi")],
+            GroupBy::Sender,
+            SortBy::Count,
+        );
+        second.uids = vec![9, 8];
+        second.cursor = 2;
+        second.loaded = true;
+        app.accounts.push(second);
+        // the first account is loading; the user has tabbed to the second
+        app.loading_acct = Some(0);
+        app.active = 1;
+
+        app.prune_uids(&[0]);
+
+        assert_eq!(app.accounts[1].uids, vec![8]);
+        assert_eq!(app.accounts[1].cursor, 1, "uid 9 sat behind the cursor");
+        assert!(
+            app.accounts[1].pending_prune.is_empty(),
+            "nothing to wait for on an account with no load in flight"
+        );
+        assert!(app.accounts[0].pending_prune.is_empty(), "wrong account");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the one key a load does own: a second load would fight the first for
+    /// the session and the task slot
+    #[test]
+    fn a_second_load_is_refused_while_one_is_already_running() {
+        let path = temp_log("keys-double-load");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.loading_acct = Some(0);
+        app.accounts[0].cursor = 0; // senders left, so `m` would otherwise fetch
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.load_rx.is_none(), "no second load spawned");
+        assert!(app.status.contains("already loading"), "{}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a reset load sorts on completion. An action in flight captured indices
+    /// into the list that sort would reorder, so it waits for the action.
+    #[test]
+    fn a_load_landing_during_an_action_does_not_reorder_the_stacks() {
+        let path = temp_log("deferred-sort");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].stacks.clear();
+        app.accounts[0].loaded = false;
+        app.loading_acct = Some(0);
+        // the one-message sender streams in first, so sorting by count moves it
+        app.on_sender(0, sender("b@x.com", vec![msg(3, "b@x.com", "one")]));
+        app.on_sender(
+            0,
+            sender(
+                "a@x.com",
+                vec![msg(1, "a@x.com", "one"), msg(2, "a@x.com", "two")],
+            ),
+        );
+        // an action is now holding index 0 — b@x.com
+        app.busy = true;
+
+        app.on_task_done(TaskDone::Batch {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::Reset,
+            cursor: 4,
+            result: Ok(()),
+        });
+        assert_eq!(keys(&app), ["b@x.com", "a@x.com"], "discovery order held");
+        assert!(!app.loading());
+        assert!(app.busy, "the action is still in flight");
+
+        // the action lands, releasing the indices — the sort runs now
+        app.on_task_done(TaskDone::Unsub {
+            stack_idxs: vec![0],
+            ok_idxs: vec![],
+            failed: 1,
+            last: "x".into(),
+            password: None,
+        });
+        assert_eq!(keys(&app), ["a@x.com", "b@x.com"], "deferred sort applied");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A trash mid-load prunes uids the load is still walking. The load's
+    /// cursor indexes the un-pruned list, so the prune waits for it to land —
+    /// applying it first would slide the cursor over undiscovered senders.
+    #[test]
+    fn uids_pruned_during_a_load_are_applied_after_its_cursor_lands() {
+        let path = temp_log("deferred-prune");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].uids = vec![5, 4, 3, 2, 1];
+        app.accounts[0].cursor = 0;
+        app.loading_acct = Some(0);
+
+        // "a@x.com" holds uids 1 and 2, at indices 4 and 3
+        let a = stack_idx(&app, "a@x.com");
+        app.prune_uids(&[a]);
+        assert_eq!(
+            app.accounts[0].uids,
+            vec![5, 4, 3, 2, 1],
+            "the list the load is walking is untouched"
+        );
+
+        app.on_task_done(TaskDone::Batch {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            cursor: 4, // the load stopped over uid 1
+            result: Ok(()),
+        });
+        assert_eq!(app.accounts[0].uids, vec![5, 4, 3]);
+        assert_eq!(app.accounts[0].cursor, 3, "uid 2 sat behind the cursor");
+        assert!(app.accounts[0].exhausted());
         let _ = std::fs::remove_file(&path);
     }
 

@@ -326,7 +326,7 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
 /// batch" from "cleared the inbox", and both are worth saying
 fn empty_state(app: &App) -> String {
     let acct = app.account();
-    if app.loading {
+    if app.active_is_loading() {
         "loading…".into()
     } else if !acct.loaded {
         "nothing loaded — press R to try again".into()
@@ -395,7 +395,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
-/// braille spinner, one frame per event-loop tick while busy
+/// braille spinner, one frame per event-loop tick while a task runs
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -410,7 +410,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::Normal | Mode::Help => {
             let mut spans = Vec::new();
-            if app.busy {
+            if app.working() {
                 spans.push(Span::styled(
                     format!("{} ", SPINNER[app.spinner % SPINNER.len()]),
                     Style::default().fg(Color::Cyan).bold(),
@@ -1011,7 +1011,7 @@ mod tests {
         app.account_mut().loaded = false;
         let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
         assert!(pane.contains("press R"), "{pane:?}");
-        app.loading = true;
+        app.loading_acct = Some(0);
         let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
         assert!(pane.contains("loading"), "{pane:?}");
     }
