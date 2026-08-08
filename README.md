@@ -12,8 +12,11 @@ fast inbox-zero over Gmail IMAP, multi-account.
 │   76  31% U LinkedIn                                            ││ 2026-06-07   Weekend deals near you                       │
 │   31  94%   GitHub                                              ││ ...                                                       │
 └─────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
- j/k · Enter expand · Space mark · a mark all · d trash · e archive · r read · u unsub · s group · o sort · / filter · Tab acct · q quit
+ 42 stacks · 873 msgs                                             s group  o sort  Tab acct
+ j/k move  ↵ open  Space mark  d trash  e archive  u unsub  / filter  ? keys
 ```
+
+Needs a terminal of at least 80x24; below that mailprune asks you to resize rather than drawing a squeezed layout.
 
 ## Install
 
@@ -64,7 +67,8 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 | key | action |
 | --- | --- |
 | `j` / `k` | move selection |
-| `Enter` / `Esc` | expand / collapse stack |
+| `Enter` | expand / collapse stack |
+| `Esc` | collapse the stack, else clear marks, else clear the filter |
 | `d` | trash entire stack (moves to Gmail Trash — recoverable 30 days) |
 | `e` | archive stack (moves to All Mail) |
 | `r` | mark stack read |
@@ -77,6 +81,7 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 | `Tab` | next account |
 | `R` | refresh |
 | `g` / `G` | top / bottom |
+| `?` | full key overlay (any key closes) |
 | `q` | quit |
 
 ## The kill-loop

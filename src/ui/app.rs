@@ -14,6 +14,8 @@ pub enum Mode {
     /// pending action awaiting y/n
     Confirm(PendingAction),
     Filter,
+    /// full keybinding overlay, dismissed by any key
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +438,7 @@ impl App {
             Mode::Normal => self.handle_normal(key),
             Mode::Confirm(_) => self.handle_confirm(key),
             Mode::Filter => self.handle_filter(key),
+            Mode::Help => self.mode = Mode::Normal,
         }
     }
 
@@ -455,6 +458,7 @@ impl App {
                     | (KeyCode::Char('G'), _)
                     | (KeyCode::Enter, _)
                     | (KeyCode::Esc, _)
+                    | (KeyCode::Char('?'), _)
             );
             if !allowed {
                 // silently dropping the key looks like a hung TUI
@@ -539,6 +543,7 @@ impl App {
                     self.spawn_load();
                 }
             }
+            (KeyCode::Char('?'), _) => self.mode = Mode::Help,
             (KeyCode::Char('R'), _) => self.spawn_load(),
             (KeyCode::Char('s'), _) => self.regroup(self.group_by.toggle()),
             (KeyCode::Char('/'), _) => {
