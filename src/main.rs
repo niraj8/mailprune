@@ -186,8 +186,6 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
 fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
     match msg {
         ui::app::TaskMsg::Status(s) => app.status = s,
-        ui::app::TaskMsg::Uids { acct_idx, uids } => app.on_uids(acct_idx, uids),
-        ui::app::TaskMsg::Sender { acct_idx, batch } => app.on_sender(acct_idx, *batch),
         ui::app::TaskMsg::Done(done) => {
             app.on_task_done(done);
             return false;
@@ -196,41 +194,31 @@ fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
     true
 }
 
-/// headless checkpoint: connect, load one batch of senders, print stacks
+/// headless checkpoint: connect, sweep one window, print stacks
 async fn cli_stacks() -> Result<()> {
     let cfg = config::load()?;
     for account in &cfg.accounts {
         println!("== {} ({}) ==", account.name, account.email);
         let password = config::get_password(&account.email)?;
         let mut client = imap_client::ImapClient::connect(account, &password).await?;
-        let uids = client.uid_list().await?;
-        let mut msgs = Vec::new();
-        let mut partial = Vec::new();
-        let (_, outcome) = imap_client::load_batch(
-            &mut client,
-            &uids,
-            0,
-            &std::collections::HashSet::new(),
-            |batch| {
-                if batch.partial {
-                    partial.push(batch.addr);
-                }
-                msgs.extend(batch.msgs);
-            },
-        )
+        let (sweep, outcome) = imap_client::sweep(&mut client, 0, |p| {
+            eprintln!("  swept {} of {} · {} stacks", p.swept, p.bound, p.stacks);
+        })
         .await;
-        outcome?;
-        let total = msgs.len();
-        let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
+        // a short window is still a window: print what landed, then say what
+        // stopped it
+        if let Err(e) = outcome {
+            eprintln!("  sweep stopped: {e:#}");
+        }
+        let total = sweep.msgs.len();
+        let stacks =
+            stacks::build_stacks(sweep.msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
         println!(
-            "{total} of {} messages, {} stacks{}\n",
-            uids.len(),
-            stacks.len(),
-            if partial.is_empty() {
-                String::new()
-            } else {
-                format!(" ({} senders only partly listed)", partial.len())
-            }
+            "{total} messages in {} of {} swept ({} in the mailbox), {} stacks\n",
+            sweep.swept,
+            sweep.bound,
+            sweep.total,
+            stacks.len()
         );
         for s in &stacks {
             println!(

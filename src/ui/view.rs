@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::imap_client::SENDERS_PER_BATCH;
+use crate::imap_client::WINDOW;
 
 use super::app::{App, Mode};
 
@@ -149,7 +149,7 @@ fn session_counters(stats: &super::app::SessionStats, max: usize) -> Option<Stri
 }
 
 /// 137482 -> "137,482" — a six-figure mailbox total is unreadable without it
-fn commas(n: usize) -> String {
+pub fn commas(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -335,7 +335,10 @@ fn empty_state(app: &App) -> String {
     } else if acct.exhausted() {
         "inbox zero — nothing left to triage".into()
     } else {
-        format!("all clear — press m to load {SENDERS_PER_BATCH} more senders")
+        format!(
+            "all clear — press m to sweep {} more messages",
+            commas(WINDOW)
+        )
     }
 }
 
@@ -507,12 +510,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 /// every binding, grouped, shown over a dimmed frame. any key dismisses.
 ///
-/// `SECTIONS` is `const`, so the batch size in the `m` row is a literal. This
+/// `SECTIONS` is `const`, so the window size in the `m` row is a literal. This
 /// makes it a build error rather than a silent drift if the constant moves.
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     const _: () = assert!(
-        SENDERS_PER_BATCH == 40,
-        "the `m` help row and the README still say 40"
+        WINDOW == 5000,
+        "the `m` help row and the README still say 5,000"
     );
     const SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         (
@@ -543,7 +546,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         (
             "view",
             &[
-                ("m", "load 40 more senders"),
+                ("m", "sweep 5,000 more messages"),
                 ("g", "group by sender / subject"),
                 ("s", "re-sort everything loaded"),
                 ("/", "filter"),
@@ -743,10 +746,11 @@ mod tests {
     fn app_with(msgs: Vec<MsgMeta>, group_by: GroupBy) -> App {
         let mut app = test_app();
         app.group_by = group_by;
-        let uids: Vec<u32> = msgs.iter().map(|m| m.uid).collect();
+        let swept = msgs.len();
         app.account_mut().stacks = build_stacks(msgs, group_by, SortBy::Count);
-        app.account_mut().cursor = uids.len();
-        app.account_mut().uids = uids;
+        app.account_mut().total = swept;
+        app.account_mut().back = swept;
+        app.account_mut().reached_end = true;
         app.account_mut().loaded = true;
         app
     }
@@ -960,8 +964,9 @@ mod tests {
     #[test]
     fn the_pane_title_reports_the_mailbox_total_not_the_loaded_count() {
         let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
-        app.account_mut().uids = (1..=137_482).collect();
-        app.account_mut().cursor = 100;
+        app.account_mut().total = 137_482;
+        app.account_mut().back = 5_000;
+        app.account_mut().reached_end = false;
 
         let title = render(&mut app, 200, MIN_HEIGHT)
             .lines()
@@ -997,15 +1002,15 @@ mod tests {
     #[test]
     fn the_emptied_stack_pane_says_whether_there_is_more_to_load() {
         let mut app = app_with(vec![], GroupBy::Sender);
-        app.account_mut().uids = vec![9, 8, 7];
-        app.account_mut().cursor = 1;
+        app.account_mut().total = 3;
+        app.account_mut().reached_end = false;
         let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
-        assert!(pane.contains("press m to load"), "{pane:?}");
+        assert!(pane.contains("press m to sweep"), "{pane:?}");
 
-        app.account_mut().cursor = 3;
+        app.account_mut().reached_end = true;
         let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
         assert!(pane.contains("inbox zero"), "{pane:?}");
-        assert!(!pane.contains("press m to load"));
+        assert!(!pane.contains("press m to sweep"));
 
         // a load that never landed is not an empty inbox
         app.account_mut().loaded = false;
