@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) -> Result<()> {
     // draw the loading frame before the first (slow) fetch
     terminal.draw(|f| ui::view::draw(f, app))?;
-    app.spawn_load();
+    app.spawn_batch(ui::app::Load::Reset);
 
     let mut events = EventStream::new();
     // drives the spinner; only polled while an action is in flight
@@ -127,11 +127,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
             loop {
                 tokio::select! {
                     msg = rx.recv() => match msg {
-                        Some(ui::app::TaskMsg::Status(s)) => app.status = s,
-                        Some(ui::app::TaskMsg::Done(done)) => {
-                            app.on_task_done(done);
-                            break;
-                        }
+                        Some(msg) => if !apply(app, msg) { break },
                         None => break,
                     },
                     _ = ticker.tick() => app.tick_spinner(),
@@ -157,11 +153,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
                     app.tick_spinner();
                 }
                 msg = rx.recv() => match msg {
-                    Some(ui::app::TaskMsg::Status(s)) => {
-                        app.status = s;
-                        app.task_rx = Some(rx);
+                    Some(msg) => {
+                        if apply(app, msg) {
+                            app.task_rx = Some(rx);
+                        }
                     }
-                    Some(ui::app::TaskMsg::Done(done)) => app.on_task_done(done),
                     None => {
                         // task died without reporting (bug); recover the UI
                         app.busy = false;
@@ -185,17 +181,53 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
     Ok(())
 }
 
-/// headless checkpoint: connect, fetch, print stacks
+/// Apply one message from the in-flight task. Returns whether the task is
+/// still running — `false` means `Done` landed and the receiver is spent.
+fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
+    match msg {
+        ui::app::TaskMsg::Status(s) => app.status = s,
+        ui::app::TaskMsg::Uids { acct_idx, uids } => app.on_uids(acct_idx, uids),
+        ui::app::TaskMsg::Sender { acct_idx, batch } => app.on_sender(acct_idx, *batch),
+        ui::app::TaskMsg::Done(done) => {
+            app.on_task_done(done);
+            return false;
+        }
+    }
+    true
+}
+
+/// headless checkpoint: connect, load one batch of senders, print stacks
 async fn cli_stacks() -> Result<()> {
     let cfg = config::load()?;
     for account in &cfg.accounts {
         println!("== {} ({}) ==", account.name, account.email);
         let password = config::get_password(&account.email)?;
         let mut client = imap_client::ImapClient::connect(account, &password).await?;
-        let msgs = client.fetch_inbox().await?;
+        let uids = client.uid_list().await?;
+        let mut msgs = Vec::new();
+        let mut partial = Vec::new();
+        let (_, outcome) = client
+            .load_batch(&uids, 0, &std::collections::HashSet::new(), |batch| {
+                if batch.partial {
+                    partial.push(batch.addr);
+                }
+                msgs.extend(batch.msgs);
+            })
+            .await;
+        outcome?;
         let total = msgs.len();
-        let stacks = stacks::build_stacks(msgs, stacks::GroupBy::Sender, stacks::SortBy::Count);
-        println!("{total} messages, {} stacks\n", stacks.len());
+        let stacks =
+            stacks::build_stacks(msgs, stacks::GroupBy::SenderSubject, stacks::SortBy::Count);
+        println!(
+            "{total} of {} messages, {} stacks{}\n",
+            uids.len(),
+            stacks.len(),
+            if partial.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} senders only partly listed)", partial.len())
+            }
+        );
         for s in &stacks {
             println!(
                 "{:>5}  {}  {} <{}>  — {}",

@@ -3,8 +3,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action_log::{Action, ActionLog, StackSnapshot};
 use crate::config::AccountConfig;
-use crate::imap_client::ImapClient;
-use crate::stacks::{GroupBy, MsgMeta, SortBy, Stack, build_stacks, sort_stacks};
+use crate::imap_client::{self, ImapClient, SenderBatch};
+use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -75,14 +75,37 @@ impl PendingAction {
 pub enum TaskMsg {
     /// progress line for the status bar
     Status(String),
+    /// the fresh uid list from a reset load. Sent ahead of the batch so the
+    /// pane title can show the true mailbox total while stacks are still
+    /// streaming in.
+    Uids {
+        acct_idx: usize,
+        uids: Vec<u32>,
+    },
+    /// one sender resolved. Fan-out is serial on the single session, so
+    /// waiting for the whole batch would be ~2.4s of blank screen; streaming
+    /// puts the first stacks up at ~200ms.
+    Sender {
+        acct_idx: usize,
+        batch: Box<SenderBatch>,
+    },
     Done(TaskDone),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapKind {
     Trash,
     Archive,
     Read,
+}
+
+/// what a load batch does to what is already on screen
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    /// `R` and first load: re-take the uid list and clear everything loaded
+    Reset,
+    /// `m`: continue from the cursor and append
+    More,
 }
 
 pub enum TaskDone {
@@ -102,14 +125,21 @@ pub enum TaskDone {
         failed: usize,
         last: String,
     },
-    /// an inbox fetch finished for `acct_idx`
-    Load {
+    /// a load batch finished for `acct_idx`; its stacks already arrived as
+    /// `TaskMsg::Sender`s
+    Batch {
         acct_idx: usize,
-        /// None when the session is unusable (connect or fetch failed)
+        /// None when the session is unusable (connect failed, or a timeout
+        /// left the session in an unknown state)
         client: Option<Box<ImapClient>>,
         /// the keychain lookup's result, cached so later loads skip it
         password: Option<String>,
-        result: Result<Vec<MsgMeta>>,
+        kind: Load,
+        /// how far discovery got. Reported alongside the outcome rather than
+        /// inside it: a failure does not un-scan the UIDs already read, and
+        /// dropping the cursor would make the next `m` re-read them.
+        cursor: usize,
+        result: Result<()>,
     },
 }
 
@@ -122,6 +152,18 @@ pub struct AccountView {
     pub expanded: bool,
     pub msg_selected: usize,
     pub loaded: bool,
+    /// every uid in INBOX, newest first, taken once per reset. UIDs are
+    /// immutable, so the cursor below survives trashing — sequence numbers
+    /// would be renumbered by every `UID MOVE`.
+    pub uids: Vec<u32>,
+    /// how far discovery has walked `uids`
+    pub cursor: usize,
+    /// lowercased addresses already fanned out, so `m` yields 20 senders that
+    /// are new rather than 20 sightings of the ones already on screen
+    pub known_senders: HashSet<String>,
+    /// senders whose fan-out the server refused: their stacks hold only the
+    /// discovery sample, so their counts under-report and are marked `~`
+    pub partial_senders: HashSet<String>,
     /// stack keys marked for bulk actions
     pub marked: HashSet<String>,
     /// stacks rendered on screen under the *current* grouping, keyed by stack
@@ -152,14 +194,39 @@ impl AccountView {
             expanded: false,
             msg_selected: 0,
             loaded: false,
+            uids: Vec::new(),
+            cursor: 0,
+            known_senders: HashSet::new(),
+            partial_senders: HashSet::new(),
             marked: HashSet::new(),
             seen: HashMap::new(),
             acted: HashSet::new(),
         }
     }
 
-    pub fn total_messages(&self) -> usize {
+    /// messages currently in stacks — a recency window over the mailbox
+    pub fn loaded_messages(&self) -> usize {
         self.stacks.iter().map(|s| s.msgs.len()).sum()
+    }
+
+    /// every message in INBOX. Falls as mail is trashed, which is the number
+    /// this tool exists to move.
+    pub fn inbox_total(&self) -> usize {
+        self.uids.len()
+    }
+
+    /// no more senders left to discover
+    pub fn exhausted(&self) -> bool {
+        self.cursor >= self.uids.len()
+    }
+
+    /// this stack's messages are only the discovery sample — the server
+    /// refused to enumerate the sender
+    pub fn is_partial(&self, stack: &Stack) -> bool {
+        !self.partial_senders.is_empty()
+            && self
+                .partial_senders
+                .contains(&stack.latest().sender_email.to_lowercase())
     }
 }
 
@@ -201,7 +268,9 @@ impl App {
             accounts: accounts.into_iter().map(AccountView::new).collect(),
             active: 0,
             mode: Mode::Normal,
-            group_by: GroupBy::Sender,
+            // sender+subject splits a sender's notification types apart, which
+            // is what a batch of 20 senders needs to be actionable
+            group_by: GroupBy::SenderSubject,
             sort_by: SortBy::Count,
             filter: String::new(),
             status: String::from("loading…"),
@@ -340,29 +409,61 @@ impl App {
     fn account_summary(&self, idx: usize) -> String {
         let acct = &self.accounts[idx];
         format!(
-            "{}: {} messages in {} stacks",
+            "{}: {} of {} messages in {} stacks",
             acct.cfg.email,
-            acct.total_messages(),
+            acct.loaded_messages(),
+            acct.inbox_total(),
             acct.stacks.len()
         )
     }
 
-    /// connect (if needed) and fetch the active account's inbox in a background
-    /// task, so the event loop keeps drawing — a cold fetch can take minutes
-    pub fn spawn_load(&mut self) {
+    /// `m`: one more batch of senders, appended. The mailbox is never loaded
+    /// whole — loading is explicit, and the pane refills only on this key.
+    fn load_more(&mut self) {
+        let acct = self.account();
+        if acct.loaded && acct.exhausted() {
+            self.status = "no more senders — R to refresh".into();
+            return;
+        }
+        self.spawn_batch(Load::More);
+    }
+
+    /// connect (if needed) and load one batch of senders in a background task,
+    /// so the event loop keeps drawing while the network work runs
+    pub fn spawn_batch(&mut self, kind: Load) {
         let acct_idx = self.active;
+        // without a uid list there is no cursor to continue from
+        let reset = kind == Load::Reset || !self.accounts[acct_idx].loaded;
+        let kind = if reset { Load::Reset } else { Load::More };
         let acct = &mut self.accounts[acct_idx];
         let cfg = acct.cfg.clone();
         let cached_password = acct.password.clone();
         // a live session is reused on refresh; taking it keeps the account from
         // being used by two paths at once
         let existing = acct.client.take();
+        if reset {
+            acct.stacks.clear();
+            acct.uids.clear();
+            acct.cursor = 0;
+            acct.known_senders.clear();
+            acct.partial_senders.clear();
+            acct.marked.clear();
+            acct.selected = 0;
+            acct.expanded = false;
+            acct.msg_selected = 0;
+            acct.loaded = false;
+            // `seen` is kept: a reset keeps the current grouping, so its
+            // snapshots still describe the same stacks
+        }
+        let uids = acct.uids.clone();
+        let cursor = acct.cursor;
+        let known = acct.known_senders.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         self.task_rx = Some(rx);
         self.busy = true;
         self.loading = true;
         self.status = if existing.is_some() {
-            format!("fetching inbox for {}…", cfg.email)
+            format!("finding senders for {}…", cfg.email)
         } else {
             format!("connecting to {}…", cfg.email)
         };
@@ -390,10 +491,12 @@ impl App {
                                     p
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+                                    let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
                                         acct_idx,
                                         client: None,
                                         password: None,
+                                        kind,
+                                        cursor,
                                         result: Err(e),
                                     }));
                                     return;
@@ -404,10 +507,12 @@ impl App {
                     match ImapClient::connect(&cfg, &password).await {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+                            let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
                                 acct_idx,
                                 client: None,
                                 password: resolved,
+                                kind,
+                                cursor,
                                 result: Err(e),
                             }));
                             return;
@@ -415,15 +520,52 @@ impl App {
                     }
                 }
             };
-            let _ = tx.send(TaskMsg::Status(format!("fetching inbox for {}…", cfg.email)));
-            let result = client.fetch_inbox().await;
-            // session state is unknown after a failure/timeout: drop the client
-            // so the next refresh reconnects fresh
-            let client = result.is_ok().then(|| Box::new(client));
-            let _ = tx.send(TaskMsg::Done(TaskDone::Load {
+            let mut uids = uids;
+            if reset {
+                let _ = tx.send(TaskMsg::Status(format!("listing {}…", cfg.email)));
+                match client.uid_list().await {
+                    Ok(list) => {
+                        uids = list;
+                        let _ = tx.send(TaskMsg::Uids {
+                            acct_idx,
+                            uids: uids.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
+                            acct_idx,
+                            client: None,
+                            password: resolved,
+                            kind,
+                            cursor,
+                            result: Err(e),
+                        }));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(TaskMsg::Status(format!(
+                "finding senders for {}…",
+                cfg.email
+            )));
+            let (cursor, result) = client
+                .load_batch(&uids, cursor, &known, |batch| {
+                    let _ = tx.send(TaskMsg::Sender {
+                        acct_idx,
+                        batch: Box::new(batch),
+                    });
+                })
+                .await;
+            // after a timeout the session state is unknown, so the client goes;
+            // a server refusal leaves the connection perfectly usable
+            let dead = result.as_ref().err().is_some_and(imap_client::is_timeout);
+            let client = (!dead).then(|| Box::new(client));
+            let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
                 acct_idx,
                 client,
                 password: resolved,
+                kind,
+                cursor,
                 result,
             }));
         });
@@ -540,11 +682,12 @@ impl App {
                     // describing the account we just left
                     self.status = self.account_summary(self.active);
                 } else {
-                    self.spawn_load();
+                    self.spawn_batch(Load::Reset);
                 }
             }
             (KeyCode::Char('?'), _) => self.mode = Mode::Help,
-            (KeyCode::Char('R'), _) => self.spawn_load(),
+            (KeyCode::Char('m'), _) => self.load_more(),
+            (KeyCode::Char('R'), _) => self.spawn_batch(Load::Reset),
             (KeyCode::Char('s'), _) => self.regroup(self.group_by.toggle()),
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::Filter;
@@ -770,12 +913,14 @@ impl App {
                     match kind {
                         ImapKind::Trash => {
                             self.log_action(Action::Trash, &stack_idxs);
+                            self.prune_uids(&stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.trashed += n_msgs;
                             self.status = format!("trashed {n_msgs} messages from {label}");
                         }
                         ImapKind::Archive => {
                             self.log_action(Action::Archive, &stack_idxs);
+                            self.prune_uids(&stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.archived += n_msgs;
                             self.status = format!("archived {n_msgs} messages from {label}");
@@ -826,35 +971,66 @@ impl App {
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
                 }
             }
-            TaskDone::Load {
+            TaskDone::Batch {
                 acct_idx,
                 client,
                 password,
+                kind,
+                cursor,
                 result,
             } => {
-                let group_by = self.group_by;
                 let sort_by = self.sort_by;
                 let acct = &mut self.accounts[acct_idx];
                 acct.client = client.map(|c| *c);
                 if password.is_some() {
                     acct.password = password;
                 }
+                // the cursor lands either way: a failure does not un-scan the
+                // UIDs discovery already read
+                acct.cursor = cursor;
                 match result {
-                    Ok(msgs) => {
-                        acct.stacks = build_stacks(msgs, group_by, sort_by);
-                        acct.selected = acct.selected.min(acct.stacks.len().saturating_sub(1));
-                        acct.expanded = false;
-                        acct.msg_selected = 0;
-                        acct.marked.clear();
+                    Ok(()) => {
                         acct.loaded = true;
-                        // `seen` is kept: a refresh keeps the current grouping,
-                        // so its snapshots still describe the same stacks
+                        if kind == Load::Reset {
+                            // the batch streamed in one sender at a time, so
+                            // until now the order is discovery order
+                            sort_stacks(&mut acct.stacks, sort_by);
+                            acct.selected = 0;
+                        }
                         self.status = self.account_summary(acct_idx);
                     }
+                    // already-streamed stacks stay on screen: a failure that
+                    // arrives halfway through is not a reason to throw away
+                    // the half that worked
                     Err(e) => self.status = format!("error: {e:#}"),
                 }
             }
         }
+    }
+
+    /// the uid list for a reset load, which arrives before the stacks do
+    pub fn on_uids(&mut self, acct_idx: usize, uids: Vec<u32>) {
+        let acct = &mut self.accounts[acct_idx];
+        acct.uids = uids;
+        acct.cursor = 0;
+    }
+
+    /// one sender resolved mid-batch. It is new by construction — discovery
+    /// skips known senders — so its stacks cannot collide with any already on
+    /// screen and are simply appended.
+    pub fn on_sender(&mut self, acct_idx: usize, batch: SenderBatch) {
+        let (group_by, sort_by) = (self.group_by, self.sort_by);
+        let acct = &mut self.accounts[acct_idx];
+        acct.known_senders.insert(batch.addr.clone());
+        if batch.partial {
+            acct.partial_senders.insert(batch.addr);
+        }
+        if batch.msgs.is_empty() {
+            return;
+        }
+        acct.stacks
+            .append(&mut build_stacks(batch.msgs, group_by, sort_by));
+        acct.loaded = true;
     }
 
     /// advance the status-bar spinner one frame
@@ -875,6 +1051,33 @@ impl App {
             format!("{} stacks", stack_idxs.len())
         };
         (uids, label)
+    }
+
+    /// Drop uids that left INBOX from the discovery list, so a later `m` does
+    /// not spend its scan budget reading a graveyard. The cursor is pulled back
+    /// by however many of them sat behind it, keeping it over the same message.
+    fn prune_uids(&mut self, stack_idxs: &[usize]) {
+        let acct = self.account_mut();
+        let gone: HashSet<u32> = stack_idxs
+            .iter()
+            .flat_map(|&i| acct.stacks[i].uids())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let cursor = acct.cursor;
+        let mut removed_before = 0;
+        let mut i = 0;
+        // retain visits in order, so `i` tracks the position in the old list
+        acct.uids.retain(|uid| {
+            let keep = !gone.contains(uid);
+            if !keep && i < cursor {
+                removed_before += 1;
+            }
+            i += 1;
+            keep
+        });
+        acct.cursor = cursor - removed_before;
     }
 
     fn remove_stacks(&mut self, mut stack_idxs: Vec<usize>) {
@@ -930,9 +1133,20 @@ mod tests {
             smtp_host: "smtp".into(),
         };
         let mut app = App::new(vec![cfg], log);
+        app.group_by = GroupBy::Sender;
         app.accounts[0].stacks = build_stacks(test_msgs(), GroupBy::Sender, SortBy::Count);
+        app.accounts[0].uids = vec![4, 3, 2, 1];
+        app.accounts[0].cursor = 4;
         app.accounts[0].loaded = true;
         app
+    }
+
+    fn sender(addr: &str, msgs: Vec<MsgMeta>) -> SenderBatch {
+        SenderBatch {
+            addr: addr.into(),
+            msgs,
+            partial: false,
+        }
     }
 
     fn read_records(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -1051,40 +1265,160 @@ mod tests {
     }
 
     #[test]
-    fn load_done_populates_stacks_and_clears_busy() {
+    fn a_reset_batch_streams_stacks_in_then_sorts_once_it_completes() {
         let path = temp_log("load-ok");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.accounts[0].stacks.clear();
         app.accounts[0].loaded = false;
         app.busy = true;
-        app.on_task_done(TaskDone::Load {
+
+        app.on_uids(0, vec![4, 3, 2, 1]);
+        assert_eq!(app.accounts[0].inbox_total(), 4);
+        // the smaller sender resolves first, so a sorted result proves the
+        // completion sort ran rather than discovery order surviving
+        app.on_sender(0, sender("b@x.com", vec![msg(3, "b@x.com", "one")]));
+        assert_eq!(app.accounts[0].stacks.len(), 1, "stacks appear mid-batch");
+        app.on_sender(
+            0,
+            sender(
+                "a@x.com",
+                vec![msg(1, "a@x.com", "one"), msg(2, "a@x.com", "two")],
+            ),
+        );
+        app.on_task_done(TaskDone::Batch {
             acct_idx: 0,
             client: None,
             password: None,
-            result: Ok(test_msgs()),
+            kind: Load::Reset,
+            cursor: 4,
+            result: Ok(()),
         });
+
         assert!(!app.busy);
         assert!(app.task_rx.is_none());
         assert!(app.accounts[0].loaded);
-        assert_eq!(app.accounts[0].stacks.len(), 2); // one per sender
-        assert!(app.status.contains("4 messages"), "status: {}", app.status);
+        assert_eq!(app.accounts[0].cursor, 4);
+        let keys: Vec<&str> = app.accounts[0]
+            .stacks
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        assert_eq!(keys, ["a@x.com", "b@x.com"], "sorted by count on reset");
+        assert!(
+            app.status.contains("3 of 4 messages"),
+            "status: {}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `m` means one thing: 20 more senders, on the end. It must not reorder
+    /// what the user is already looking at.
+    #[test]
+    fn a_continuation_batch_appends_without_reordering() {
+        let path = temp_log("load-more");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let before: Vec<String> = app.accounts[0]
+            .stacks
+            .iter()
+            .map(|s| s.key.clone())
+            .collect();
+
+        // one message, so sorting by count would put it first
+        app.on_sender(0, sender("c@x.com", vec![msg(9, "c@x.com", "hi")]));
+        app.on_task_done(TaskDone::Batch {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            cursor: 4,
+            result: Ok(()),
+        });
+
+        let after: Vec<String> = app.accounts[0]
+            .stacks
+            .iter()
+            .map(|s| s.key.clone())
+            .collect();
+        assert_eq!(after[..before.len()], before[..], "the head is untouched");
+        assert_eq!(after.last().unwrap(), "c@x.com");
+        assert!(app.accounts[0].known_senders.contains("c@x.com"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// omission from a triage list is undetectable, so a refused fan-out shows
+    /// what it managed to read and says the count is short
+    #[test]
+    fn a_refused_sender_becomes_a_partial_stack_rather_than_a_gap() {
+        let path = temp_log("partial");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.on_sender(
+            0,
+            SenderBatch {
+                addr: "c@x.com".into(),
+                msgs: vec![msg(9, "c@x.com", "hi")],
+                partial: true,
+            },
+        );
+        let acct = &app.accounts[0];
+        let stack = acct.stacks.last().unwrap();
+        assert!(acct.is_partial(stack));
+        assert!(
+            !acct.is_partial(&acct.stacks[0]),
+            "the others are unaffected"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn load_error_clears_busy_and_drops_client() {
+    fn batch_error_clears_busy_and_keeps_what_already_streamed_in() {
         let path = temp_log("load-err");
         let mut app = test_app(ActionLog::at(path.clone()));
+        let before = app.accounts[0].stacks.len();
         app.busy = true;
-        app.on_task_done(TaskDone::Load {
+        app.on_task_done(TaskDone::Batch {
             acct_idx: 0,
             client: None,
             password: None,
+            kind: Load::Reset,
+            cursor: 7,
             result: Err(anyhow::anyhow!("boom")),
         });
         assert!(!app.busy);
         assert!(app.accounts[0].client.is_none());
+        assert_eq!(app.accounts[0].stacks.len(), before);
+        // a failure does not un-scan what discovery already read; dropping the
+        // cursor would make the next `m` spend its whole budget re-reading it
+        assert_eq!(app.accounts[0].cursor, 7);
         assert!(app.status.starts_with("error:"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the cursor is an index, so removing entries behind it would slide it
+    /// forward over senders that were never discovered
+    #[test]
+    fn pruning_acted_uids_holds_the_cursor_over_the_same_message() {
+        let path = temp_log("prune");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].uids = vec![5, 4, 3, 2, 1];
+        app.accounts[0].cursor = 3; // next unread uid is 2
+        // stack "a@x.com" holds uids 1 and 2 — one behind the cursor, one ahead
+        let a = stack_idx(&app, "a@x.com");
+        app.prune_uids(&[a]);
+
+        assert_eq!(app.accounts[0].uids, vec![5, 4, 3]);
+        assert_eq!(app.accounts[0].cursor, 3, "uid 3 is still next");
+        assert!(app.accounts[0].exhausted());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn m_on_an_exhausted_list_says_so_instead_of_reconnecting() {
+        let path = temp_log("m-exhausted");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.handle_normal(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.task_rx.is_none(), "no load was spawned");
+        assert!(app.status.contains("no more senders"), "{}", app.status);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1110,15 +1444,21 @@ mod tests {
             imap_host: "imap".into(),
             smtp_host: "smtp".into(),
         });
-        second.stacks = build_stacks(vec![msg(9, "c@x.com", "hi")], GroupBy::Sender, SortBy::Count);
+        second.stacks = build_stacks(
+            vec![msg(9, "c@x.com", "hi")],
+            GroupBy::Sender,
+            SortBy::Count,
+        );
+        second.uids = vec![9];
+        second.cursor = 1;
         second.loaded = true;
         app.accounts.push(second);
-        app.status = "me@x.com: 4 messages in 2 stacks".into();
+        app.status = "me@x.com: 4 of 4 messages in 2 stacks".into();
 
         app.handle_normal(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         assert_eq!(app.active, 1);
-        assert_eq!(app.status, "other@x.com: 1 messages in 1 stacks");
+        assert_eq!(app.status, "other@x.com: 1 of 1 messages in 1 stacks");
         let _ = std::fs::remove_file(&path);
     }
 
