@@ -1,6 +1,6 @@
 # Sweep the mailbox instead of discovering senders and fanning each one out
 
-Loading the mailbox used to sample recent headers until 40 new senders turned up, then run a search and a fetch per sender to enumerate all their mail — about 80 serial round trips with the keyboard locked before the first decision. We now sweep the mailbox newest-first in header chunks and merge each chunk into the stacks on screen, so the first stacks land after one round trip at any mailbox size. A sender is fanned out when the user acts on them, not for all 40 up front.
+Loading the mailbox used to sample recent headers until 40 new senders turned up, then run a search and a fetch per sender to enumerate all their mail — about 80 serial round trips with the keyboard locked before the first decision. We now sweep the mailbox newest-first in header chunks and build the stacks from what the sweep read. A sender is fanned out when the user acts on them, not for all 40 up front. What makes the wait tolerable is that the sweep is bounded (ADR 0002), not that it renders as it goes — nothing renders until the window completes (ADR 0003).
 
 A sweep runs to the end of a bounded window and cannot be interrupted. The TUI is inert while it runs: `q` and ctrl-c respond, nothing else does. The bound, not the mailbox size, is what makes that wait finite.
 
@@ -21,7 +21,7 @@ A sweep runs to the end of a bounded window and cannot be interrupted. The TUI i
 - Acting on a stack still reaches all of that sender's mail. That cost moves from 40 fan-outs per load to one per decision.
 - The TUI is inert for the length of a sweep — every key except `q` and ctrl-c is refused, mutating or not. The UI has to say so plainly rather than swallow keys in silence.
 - The window is bounded, so that inert stretch is finite and roughly constant whatever the mailbox size. `m` — load (m)ore — widens the window with another sweep, inert on the same terms. The bound's unit and default are not decided here.
-- Chunk-by-chunk merging stays, but it now buys **feedback**, not early action: the user watches the list fill, and cannot act on it until it stops.
+- Chunking stays, but it buys neither early action nor a filling list. It bounds each command's timeout and lets a sweep that fails part-way keep the chunks that landed. Feedback is the alert's counter (ADR 0003).
 - One session throughout. The sweep and the actions never overlap, so nothing concurrent is introduced.
 
 ## Not a revert of #15
