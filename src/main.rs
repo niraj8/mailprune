@@ -186,6 +186,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut ui::app::App) ->
 fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
     match msg {
         ui::app::TaskMsg::Status(s) => app.status = s,
+        ui::app::TaskMsg::Sweeping(p) => app.on_sweep_progress(p),
         ui::app::TaskMsg::Done(done) => {
             app.on_task_done(done);
             return false;
