@@ -1255,6 +1255,32 @@ mod tests {
         assert!(rows.contains("Alice") && rows.contains("Bob"));
     }
 
+    /// Each account's window is its own 5,000 UIDs — a shared budget would
+    /// make one account's window depend on another's mail — so the pane title
+    /// has to report the window of the account it is showing.
+    #[test]
+    fn each_account_reports_its_own_window() {
+        let mut app = app_with_a_bounded_window();
+        let mut second = crate::ui::app::AccountView::new(AccountConfig {
+            name: "other".into(),
+            email: "other@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        });
+        second.total = 3_120;
+        second.back = 3_120;
+        second.reached_end = true;
+        second.visited = true;
+        second.loaded = true;
+        app.accounts.push(second);
+
+        assert!(pane_title(&mut app, 200).contains("newest 5,000 of 137,482 msgs"));
+        app.active = 1;
+        let title = pane_title(&mut app, 200);
+        assert!(title.contains("all 3,120 msgs"), "{title:?}");
+        assert!(!title.contains("137,482"), "{title:?}");
+    }
+
     /// Both numbers are about mail that is still there, so both fall as it is
     /// trashed — a window that kept claiming 5,000 after the user emptied it
     /// would be describing messages that no longer exist.

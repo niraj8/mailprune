@@ -269,6 +269,11 @@ pub struct AccountView {
     pub client: Option<ImapClient>,
     pub stacks: Vec<Stack>,
     pub selected: usize,
+    /// A sweep has been run against this account this session. Distinct from
+    /// `loaded`, which says one *landed*: `Tab` is a navigation key, and an
+    /// account whose password is wrong would otherwise hold the TUI inert for
+    /// the connect timeout on every pass through the tab bar. `R` is the retry.
+    pub visited: bool,
     pub loaded: bool,
     /// every message in INBOX, from the last sweep's `EXISTS`
     pub total: usize,
@@ -306,6 +311,7 @@ impl AccountView {
             client: None,
             stacks: Vec::new(),
             selected: 0,
+            visited: false,
             loaded: false,
             total: 0,
             back: 0,
@@ -634,6 +640,9 @@ impl App {
             // `seen` is kept: a reset keeps the current grouping, so its
             // snapshots still describe the same stacks
         }
+        // marked here rather than on the outcome: a sweep that failed has still
+        // been spent, and `Tab` must not spend another one on the way past
+        acct.visited = true;
         let back = acct.back;
         let (tx, rx) = mpsc::unbounded_channel();
         self.task_rx = Some(rx);
@@ -844,12 +853,25 @@ impl App {
             (KeyCode::Tab, _) => {
                 self.active = (self.active + 1) % self.accounts.len();
                 self.filter.clear();
-                if self.account().loaded {
+                // Each account sweeps on the first `Tab` to it, not at launch:
+                // with N accounts, sweeping all of them at startup multiplies
+                // the wait the bound exists to protect (ADR 0002). Its window
+                // is its own — a shared budget would make one account's window
+                // depend on another's mail.
+                if !self.account().visited {
+                    self.spawn_batch(Load::Reset);
+                } else if self.account().loaded {
                     // the status line is global: without this it keeps
                     // describing the account we just left
                     self.status = self.account_summary(self.active);
                 } else {
-                    self.spawn_batch(Load::Reset);
+                    // swept once and nothing landed. `Tab` does not try again
+                    // — that is `R`, and it is named here rather than spent on
+                    // every pass through the tab bar.
+                    self.status = format!(
+                        "{}: nothing swept — press R to try again",
+                        self.account().cfg.email
+                    );
                 }
             }
             (KeyCode::Char('?'), _) => self.mode = Mode::Help,
@@ -1442,6 +1464,7 @@ mod tests {
         app.accounts[0].total = 4;
         app.accounts[0].back = 4;
         app.accounts[0].reached_end = true;
+        app.accounts[0].visited = true;
         app.accounts[0].loaded = true;
         app
     }
@@ -1984,33 +2007,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn account(email: &str) -> AccountView {
+        AccountView::new(AccountConfig {
+            name: email.into(),
+            email: email.into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        })
+    }
+
+    /// an account that has been swept and has mail in its window
+    fn swept_account(email: &str) -> AccountView {
+        let mut acct = account(email);
+        acct.stacks = build_stacks(
+            vec![msg(9, "c@x.com", "hi")],
+            GroupBy::Sender,
+            SortBy::Count,
+        );
+        acct.total = 1;
+        acct.back = 1;
+        acct.visited = true;
+        acct.loaded = true;
+        acct
+    }
+
     /// the status line is shared by every account, so switching to one that
     /// needs no fetch must still rewrite it
     #[test]
     fn tab_to_a_loaded_account_restates_its_summary() {
         let path = temp_log("tab-status");
         let mut app = test_app(ActionLog::at(path.clone()));
-        let mut second = AccountView::new(AccountConfig {
-            name: "other".into(),
-            email: "other@x.com".into(),
-            imap_host: "imap".into(),
-            smtp_host: "smtp".into(),
-        });
-        second.stacks = build_stacks(
-            vec![msg(9, "c@x.com", "hi")],
-            GroupBy::Sender,
-            SortBy::Count,
-        );
-        second.total = 1;
-        second.back = 1;
-        second.loaded = true;
-        app.accounts.push(second);
+        app.accounts.push(swept_account("other@x.com"));
         app.status = "me@x.com: 4 of 4 messages in 2 stacks".into();
 
-        app.handle_normal(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Tab);
 
         assert_eq!(app.active, 1);
         assert_eq!(app.status, "other@x.com: 1 of 1 messages in 1 stacks");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR 0002: with N accounts, sweeping all of them at startup multiplies
+    /// the wait the bound exists to protect. Only the account on screen sweeps.
+    #[tokio::test]
+    async fn launching_with_three_accounts_costs_one_sweep() {
+        let path = temp_log("tab-launch");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0] = account("me@x.com");
+        app.accounts.push(account("two@x.com"));
+        app.accounts.push(account("three@x.com"));
+
+        // what main.rs does before the event loop
+        app.spawn_batch(Load::Reset);
+
+        assert!(app.accounts[0].visited, "the account on screen sweeps");
+        assert!(
+            app.accounts[1..].iter().all(|a| !a.visited),
+            "the other two wait for the Tab that shows them"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// each account's window is its own — a shared budget would make one
+    /// account's window depend on another's mail
+    #[tokio::test]
+    async fn tab_sweeps_a_never_visited_account_once_and_not_again() {
+        let path = temp_log("tab-once");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts.push(account("other@x.com"));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.active, 1);
+        assert!(app.loading, "the first Tab to it sweeps, inert like any sweep");
+        assert!(app.accounts[1].visited);
+
+        // its window lands, its own 5,000 rather than a share of anything
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 1,
+            client: None,
+            password: None,
+            kind: Load::Reset,
+            sweep: window(vec![msg(9, "c@x.com", "hi")], 20_000, 5_000, 5_000),
+            result: Ok(()),
+        });
+        assert_eq!(app.accounts[1].window(), 5_000);
+        assert_eq!(app.accounts[0].window(), 4, "account 0's is untouched");
+
+        press(&mut app, KeyCode::Tab); // back to 0
+        press(&mut app, KeyCode::Tab); // and to 1 again
+        assert_eq!(app.active, 1);
+        assert!(app.task_rx.is_none(), "tabbing back and forth re-swept it");
+        assert!(!app.loading);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `Tab` is a navigation key. An account whose sweep found nothing — a bad
+    /// password, a dead host — would otherwise hold the TUI inert for the
+    /// connect timeout on every pass through the tab bar. `R` is the retry, and
+    /// the row that says so is what `Tab` leaves behind instead.
+    #[tokio::test]
+    async fn tab_does_not_re_sweep_an_account_whose_sweep_landed_nothing() {
+        let path = temp_log("tab-failed");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let mut failed = account("other@x.com");
+        failed.visited = true;
+        app.accounts.push(failed);
+
+        press(&mut app, KeyCode::Tab);
+
+        assert_eq!(app.active, 1);
+        assert!(app.task_rx.is_none(), "no sweep was spawned");
+        assert!(!app.loading);
+        assert!(app.status.contains("press R"), "{}", app.status);
+
+        // and `R` is that retry
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.loading);
         let _ = std::fs::remove_file(&path);
     }
 
