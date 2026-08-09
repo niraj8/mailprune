@@ -3,7 +3,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action_log::{Action, ActionLog, StackSnapshot};
 use crate::config::AccountConfig;
-use crate::imap_client::{self, ImapClient};
+use crate::imap_client::{self, ImapClient, SweepProgress};
 use crate::stacks::{GroupBy, MsgMeta, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
 
@@ -11,9 +11,23 @@ use super::view::commas;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
-/// what still responds while a sweep runs, named on screen for its whole
-/// length — the TUI is inert on everything else (ADR 0001)
-const LIVE_KEYS: &str = "q quits";
+/// The one centered slot for "the app is busy" and for "the app wants an
+/// answer" (ADR 0004). The confirm is the third state of the same box, but its
+/// copy already lives in `Mode::Confirm` — the view merges the two rather than
+/// duplicating a pending action here.
+pub enum Alert {
+    /// a sweep is running and the TUI is inert (ADR 0001). `progress` is None
+    /// until the first chunk reports, which is where `starting` earns its keep.
+    Sweeping {
+        /// what the sweep is doing before it has a count to show
+        starting: String,
+        progress: Option<SweepProgress>,
+    },
+    /// The last sweep stopped. It stays up until a key dismisses it: the status
+    /// row behind it keeps the detail, but the count is the thing the user has
+    /// to be told, and a line that scrolls past unread has not told them.
+    Failed(String),
+}
 
 /// the two keys that leave, live in every state including a running sweep
 fn is_quit(key: KeyEvent) -> bool {
@@ -50,6 +64,9 @@ pub enum PendingAction {
 }
 
 impl PendingAction {
+    /// The alert's headline. It does not name `y`/`n`: the hint line under it
+    /// does, and the box saying the same thing twice is the ADR 0004 layout
+    /// wasting one of its three lines.
     pub fn prompt(&self, acct: &AccountView) -> String {
         let summary = |idxs: &[usize]| -> String {
             let msgs: usize = idxs.iter().map(|&i| acct.stacks[i].msgs.len()).sum();
@@ -61,10 +78,10 @@ impl PendingAction {
         };
         match self {
             PendingAction::Trash { stack_idxs } => {
-                format!("Trash {}? [y/n]", summary(stack_idxs))
+                format!("Trash {}?", summary(stack_idxs))
             }
             PendingAction::Archive { stack_idxs } => {
-                format!("Archive {}? [y/n]", summary(stack_idxs))
+                format!("Archive {}?", summary(stack_idxs))
             }
             PendingAction::Unsubscribe { stack_idxs } => {
                 if let [i] = stack_idxs[..] {
@@ -73,13 +90,13 @@ impl PendingAction {
                         .and_then(unsubscribe::pick_method)
                         .map(|m| m.describe())
                         .unwrap_or("?");
-                    format!("Unsubscribe from {} via {via}? [y/n]", summary(stack_idxs))
+                    format!("Unsubscribe from {} via {via}?", summary(stack_idxs))
                 } else {
-                    format!("Unsubscribe from {}? [y/n]", summary(stack_idxs))
+                    format!("Unsubscribe from {}?", summary(stack_idxs))
                 }
             }
             PendingAction::TrashAfterUnsub { stack_idxs } => {
-                format!("Done. Also trash {}? [y/n]", summary(stack_idxs))
+                format!("Done. Also trash {}?", summary(stack_idxs))
             }
         }
     }
@@ -87,9 +104,13 @@ impl PendingAction {
 
 /// messages sent from a spawned action task back to the event loop
 pub enum TaskMsg {
-    /// progress line for the status bar. A sweep's chunks report here and
-    /// nowhere else: nothing renders until the window completes (ADR 0003).
+    /// progress line for the status bar
     Status(String),
+    /// One chunk of a sweep landed. Numbers rather than a formatted line: the
+    /// alert owns the wording, and it needs the counts for its bar as well as
+    /// its headline. A sweep's chunks report here and nowhere else — nothing
+    /// renders until the window completes (ADR 0003).
+    Sweeping(SweepProgress),
     Done(TaskDone),
 }
 
@@ -269,6 +290,12 @@ pub struct App {
     pub sort_by: SortBy,
     pub filter: String,
     pub status: String,
+    /// the one centered slot, when something is in it (ADR 0004)
+    pub alert: Option<Alert>,
+    /// Colour is off (`NO_COLOR`), so the alert's frame carries on its own.
+    /// Read once at startup — the environment does not change under a running
+    /// TUI. #5 lifts this into the theme module that owns every colour here.
+    pub no_color: bool,
     pub busy: bool,
     /// frame counter for the status-bar spinner, advanced by the event loop's
     /// ticker while `busy`
@@ -294,6 +321,9 @@ impl App {
             sort_by: SortBy::Count,
             filter: String::new(),
             status: String::from("loading…"),
+            alert: None,
+            // https://no-color.org: set and non-empty turns colour off
+            no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             busy: false,
             spinner: 0,
             loading: false,
@@ -514,15 +544,18 @@ impl App {
         self.busy = true;
         self.loading = true;
         // ADR 0001 requires the UI to say plainly that keys are refused rather
-        // than swallow them in silence. Until #28 gives the alert its hint
-        // line, the status row is the only channel — and it has to be standing
-        // text, because a refusal posted on the keypress would be overwritten
-        // by the next progress tick before it could be read.
+        // than swallow them in silence; the alert's hint line is where it says
+        // so, for the sweep's whole length. The status row keeps the same words
+        // for what shows behind the box and after it comes down.
         self.status = if existing.is_some() {
-            format!("sweeping {}… ({LIVE_KEYS})", cfg.email)
+            format!("sweeping {}…", cfg.email)
         } else {
-            format!("connecting to {}… ({LIVE_KEYS})", cfg.email)
+            format!("connecting to {}…", cfg.email)
         };
+        self.alert = Some(Alert::Sweeping {
+            starting: self.status.clone(),
+            progress: None,
+        });
         tokio::spawn(async move {
             // handed back in the Done message so later loads and the
             // unsubscribe path skip the keychain
@@ -576,16 +609,10 @@ impl App {
                     }
                 }
             };
-            let email = cfg.email.clone();
             let (sweep, result) = imap_client::sweep(&mut client, back, |p| {
                 // the only feedback a sweep gives: the list itself does not
                 // move until the window is complete (ADR 0003)
-                let _ = tx.send(TaskMsg::Status(format!(
-                    "sweeping {email} — {} of {} · {} stacks ({LIVE_KEYS})",
-                    commas(p.swept),
-                    commas(p.bound),
-                    p.stacks
-                )));
+                let _ = tx.send(TaskMsg::Sweeping(p));
             })
             .await;
             // after a timeout the session state is unknown, so the client goes;
@@ -619,6 +646,19 @@ impl App {
         if self.loading {
             if is_quit(key) {
                 self.should_quit = true;
+            }
+            return;
+        }
+        // The failed alert names two keys and swallows the rest, which is what
+        // "any key to continue" means: whatever the user pressed, the box comes
+        // down and that keypress is spent doing it. Letting the key through as
+        // well would act on a list the user was not looking at.
+        if matches!(self.alert, Some(Alert::Failed(_))) {
+            self.alert = None;
+            if is_quit(key) {
+                self.should_quit = true;
+            } else if key.code == KeyCode::Char('m') {
+                self.load_more();
             }
             return;
         }
@@ -913,11 +953,20 @@ impl App {
         });
     }
 
+    /// one chunk of the running sweep landed
+    pub fn on_sweep_progress(&mut self, p: SweepProgress) {
+        if let Some(Alert::Sweeping { progress, .. }) = &mut self.alert {
+            *progress = Some(p);
+        }
+    }
+
     /// apply a finished task's outcome to app state (runs on the event loop)
     pub fn on_task_done(&mut self, done: TaskDone) {
         self.busy = false;
         self.loading = false;
         self.task_rx = None;
+        // whatever raised it is over; a failed sweep puts its own back up below
+        self.alert = None;
         match done {
             TaskDone::Imap {
                 client,
@@ -1042,14 +1091,27 @@ impl App {
                     // half that worked. `back` stopped where the sweep did, so
                     // `m` retries the remainder of this window before it
                     // advances (ADR 0003).
-                    Err(e) if sweep.short() => {
+                    Err(e) if sweep.anchored && sweep.short() => {
+                        // the count goes in the alert, where it cannot be
+                        // missed; the reason stays in the status row, which is
+                        // still there once the alert is dismissed
+                        self.alert = Some(Alert::Failed(format!(
+                            "stopped at {} of {}",
+                            commas(sweep.swept),
+                            commas(sweep.bound)
+                        )));
                         self.status = format!(
                             "sweep stopped at {} of {} — press m to retry ({e:#})",
                             commas(sweep.swept),
                             commas(sweep.bound)
                         )
                     }
-                    Err(e) => self.status = format!("error: {e:#}"),
+                    // a sweep that never anchored has no count to report, so
+                    // the alert carries the reason itself
+                    Err(e) => {
+                        self.alert = Some(Alert::Failed(format!("{e:#}")));
+                        self.status = format!("error: {e:#}");
+                    }
                 }
             }
         }
@@ -1744,20 +1806,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// ADR 0001: the refusal is said plainly rather than swallowed in silence.
-    /// Until #28 gives the alert a hint line, the status row carries it — and
-    /// it has to stand for the sweep's whole length, because a line posted on
-    /// the keypress would be overwritten by the next progress tick.
+    /// ADR 0001: the refusal is said plainly rather than swallowed in silence,
+    /// and ADR 0004 puts it on the alert's hint line, standing for the sweep's
+    /// whole length. The status row keeps a plain line for what shows behind
+    /// the box and once it comes down.
     // `spawn_batch` puts the sweep on the runtime; the task never runs here,
-    // the status it sets on the way out is the whole assertion
+    // the state it sets on the way out is the whole assertion
     #[tokio::test]
-    async fn a_running_sweep_names_the_keys_that_still_respond() {
+    async fn a_running_sweep_raises_the_alert_that_names_the_live_keys() {
         let path = temp_log("sweep-hint");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.accounts[0].loaded = false;
         app.spawn_batch(Load::Reset);
         assert!(app.loading);
-        assert!(app.status.contains("q quits"), "status: {}", app.status);
+        assert!(matches!(app.alert, Some(Alert::Sweeping { .. })));
+        assert!(
+            !app.status.contains("q quit"),
+            "the hint line owns the refusal now: {}",
+            app.status
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1893,6 +1960,136 @@ mod tests {
         });
 
         assert_eq!(app.accounts[0].selected, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR 0004: a sweep's progress is the alert's business. The status row
+    /// keeps a standing line for what is behind the alert, but the counts the
+    /// user watches arrive as numbers, not as a pre-formatted string.
+    #[tokio::test]
+    async fn a_sweep_reports_its_progress_into_the_alert_as_numbers() {
+        let path = temp_log("alert-progress");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].loaded = false;
+        app.spawn_batch(Load::Reset);
+
+        let Some(Alert::Sweeping { starting, progress }) = &app.alert else {
+            panic!("no sweeping alert: spawn_batch must raise one");
+        };
+        assert!(starting.contains("me@x.com"), "{starting:?}");
+        assert!(progress.is_none(), "nothing has been swept yet");
+
+        app.on_sweep_progress(SweepProgress {
+            swept: 3_000,
+            bound: 5_000,
+            stacks: 41,
+        });
+        let Some(Alert::Sweeping {
+            progress: Some(p), ..
+        }) = &app.alert
+        else {
+            panic!("progress did not land on the alert");
+        };
+        assert_eq!((p.swept, p.bound, p.stacks), (3_000, 5_000, 41));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sweep that stopped has something to say and no way to say it once the
+    /// alert comes down, so the alert stays up until a key dismisses it.
+    #[test]
+    fn a_short_window_leaves_a_failed_alert_up_until_a_key_dismisses_it() {
+        let path = temp_log("alert-failed");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].back = 0;
+        app.accounts[0].reached_end = false;
+        app.loading = true;
+        app.busy = true;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![], 5_000, 5_000, 2_400),
+            result: Err(anyhow::anyhow!("NO [CANNOT] fetch")),
+        });
+
+        let Some(Alert::Failed(headline)) = &app.alert else {
+            panic!("a stopped sweep must raise the alert, not only a status line");
+        };
+        assert_eq!(headline, "stopped at 2,400 of 5,000");
+
+        // any key clears it, and does nothing else
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(app.alert.is_none(), "the key dismissed the alert");
+        assert_eq!(app.accounts[0].selected, 0, "and was swallowed doing it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `m retry` on the failed alert is the whole point of naming it there
+    #[tokio::test]
+    async fn m_on_a_failed_alert_retries_the_remainder_of_the_window() {
+        let path = temp_log("alert-retry");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].reached_end = false;
+        app.alert = Some(Alert::Failed("stopped at 2,400 of 5,000".into()));
+
+        send(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(app.loading, "m spawned the retry");
+        assert!(
+            matches!(app.alert, Some(Alert::Sweeping { .. })),
+            "and the alert moved on to the sweep it started"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// quitting is live in every state, the failed alert included
+    #[test]
+    fn q_still_quits_from_a_failed_alert() {
+        let path = temp_log("alert-quit");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.alert = Some(Alert::Failed("stopped at 0 of 5,000".into()));
+        send(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a sweep that lands cleanly has nothing left to say, so nothing stays up
+    #[test]
+    fn a_completed_sweep_takes_its_alert_down() {
+        let path = temp_log("alert-done");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.alert = Some(Alert::Sweeping {
+            starting: "sweeping me@x.com…".into(),
+            progress: None,
+        });
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(9, "c@x.com", "hi")], 9, 1, 1),
+            result: Ok(()),
+        });
+
+        assert!(app.alert.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the hint line answers `[y/n]`, so the prompt saying it too is the UI
+    /// stating the same thing twice in one box
+    #[test]
+    fn the_confirm_prompt_leaves_the_keys_to_the_hint_line() {
+        let path = temp_log("alert-prompt");
+        let app = test_app(ActionLog::at(path.clone()));
+        let prompt = PendingAction::Trash {
+            stack_idxs: vec![0],
+        }
+        .prompt(app.account());
+        assert!(!prompt.contains("[y/n]"), "{prompt:?}");
+        assert!(prompt.ends_with('?'), "{prompt:?}");
         let _ = std::fs::remove_file(&path);
     }
 

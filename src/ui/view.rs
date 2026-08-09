@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::imap_client::WINDOW;
 
-use super::app::{App, Mode};
+use super::app::{Alert, App, Mode};
 
 /// the layout needs 6 rows (tab + 3 panes + status + help) and enough columns
 /// for a stack row; below this the Cassowary solver silently squeezes panes to
@@ -38,12 +38,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(outer[1]);
 
+    // An alert answers every key itself, so the rows that advertise the other
+    // keys come down for as long as it is up — otherwise the UI offers keys it
+    // is about to swallow, which is what ADR 0001 rules out. The alert's own
+    // hint line names what still responds.
+    let alert = alert_view(app);
+
     draw_stack_list(frame, app, panes[0]);
     draw_detail(frame, app, panes[1]);
-    draw_status(frame, app, outer[2]);
-    draw_help(frame, app, outer[3]);
+    draw_status(frame, app, outer[2], alert.is_some());
+    draw_help(frame, app, outer[3], alert.is_some());
 
-    if matches!(app.mode, Mode::Help) {
+    // the alert owns the screen while it is up, so nothing else overlays with
+    // it — a sweep refuses `?`, and a confirm is answered before anything else
+    if let Some(alert) = alert {
+        draw_alert(frame, app, &alert);
+    } else if matches!(app.mode, Mode::Help) {
         draw_help_overlay(frame, frame.area());
     }
 }
@@ -401,30 +411,173 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 /// braille spinner, one frame per event-loop tick while busy
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+/// the alert's frame: 60 columns because the first sweep draws it over a blank
+/// screen, where a smaller box reads as a crash rather than as progress, and
+/// six rows for a border, a headline, a bar and a hint (ADR 0004)
+const ALERT_W: u16 = 60;
+const ALERT_H: u16 = 6;
+
+/// what the alert's three states have in common — the same box, filled in
+struct AlertView {
+    /// names the state; takes `colour` along with the border
+    title: &'static str,
+    colour: Color,
+    headline: String,
+    /// `(done, of)` when there is progress to show. The spinner rides along
+    /// with it: the bar carries progress, the spinner carries liveness, and a
+    /// bar that has not moved in two seconds is ambiguous where a stopped
+    /// spinner is not (ADR 0004).
+    bar: Option<(usize, usize)>,
+    /// the keys that work right now, and only those
+    hint: &'static str,
+}
+
+/// What is in the one centered slot, or nothing. The confirm's copy lives in
+/// `Mode::Confirm` rather than in `Alert`, so the two are merged here; they
+/// cannot both be up, because a sweep refuses the keys that open a confirm.
+fn alert_view(app: &App) -> Option<AlertView> {
+    if let Mode::Confirm(action) = &app.mode {
+        return Some(AlertView {
+            title: " confirm ",
+            colour: Color::Yellow,
+            headline: action.prompt(app.account()),
+            bar: None,
+            hint: "y yes · n no",
+        });
+    }
+    match app.alert.as_ref()? {
+        Alert::Sweeping { starting, progress } => Some(AlertView {
+            title: " sweeping ",
+            colour: Color::Cyan,
+            headline: progress.map_or_else(
+                || starting.clone(),
+                |p| {
+                    format!(
+                        "{} of {} · {} stacks",
+                        commas(p.swept),
+                        commas(p.bound),
+                        p.stacks
+                    )
+                },
+            ),
+            bar: progress.map(|p| (p.swept, p.bound)),
+            hint: "q quit",
+        }),
+        Alert::Failed(headline) => Some(AlertView {
+            title: " sweep failed ",
+            colour: Color::Red,
+            headline: headline.clone(),
+            bar: None,
+            hint: "m retry · any key to continue",
+        }),
+    }
+}
+
+/// the foreground everything behind the alert is repainted with. Overwriting
+/// rather than the `DIM` modifier, because terminals are free to ignore `DIM`.
+const MUTED: Color = Color::DarkGray;
+
+fn draw_alert(frame: &mut Frame, app: &App, alert: &AlertView) {
+    // Under NO_COLOR the box's border and its `Clear` carry the whole job of
+    // separating the alert from the app behind it — which is the reason the
+    // box is large. #5 replaces both of these with the theme module.
+    let colour = if app.no_color {
+        Color::Reset
+    } else {
+        alert.colour
+    };
+    if !app.no_color {
+        let whole = frame.area();
+        frame
+            .buffer_mut()
+            .set_style(whole, Style::default().fg(MUTED));
+    }
+
+    let area = centered(frame.area(), ALERT_W, ALERT_H);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colour))
+            .title(Span::styled(
+                alert.title,
+                Style::default().fg(colour).bold(),
+            )),
+        area,
+    );
+
+    // headline, blank, bar, hint — the blank and the bar row hold their places
+    // in the states that have no bar, so the box is one shape in every state
+    let inner = area.inner(ratatui::layout::Margin::new(2, 1));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1); 4])
+        .split(inner);
+
+    let width = inner.width as usize;
+    let headline = match alert.bar {
+        // the spinner costs two columns of the headline's budget
+        Some(_) => format!(
+            "{} {}",
+            SPINNER[app.spinner % SPINNER.len()],
+            truncate(&alert.headline, width.saturating_sub(2))
+        ),
+        None => truncate(&alert.headline, width),
+    };
+    frame.render_widget(
+        Paragraph::new(headline)
+            .alignment(Alignment::Center)
+            .style(Style::default().bold()),
+        rows[0],
+    );
+    if let Some((done, of)) = alert.bar {
+        frame.render_widget(
+            Paragraph::new(progress_bar(done, of, width)).style(Style::default().fg(colour)),
+            rows[2],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(alert.hint)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(if app.no_color {
+                Color::Reset
+            } else {
+                Color::Gray
+            })),
+        rows[3],
+    );
+}
+
+fn progress_bar(done: usize, of: usize, width: usize) -> String {
+    let filled = (done * width) / of.max(1);
+    let filled = filled.min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// a `w`x`h` box in the middle of `area`, shrunk to fit if it has to be
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, alert_up: bool) {
+    // the spinner and the confirm both moved to the alert (ADR 0004); what is
+    // left is the idle text and, on the right, the view-state keys
     let line = match &app.mode {
-        Mode::Confirm(action) => Line::from(Span::styled(
-            action.prompt(app.account()),
-            Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
-        )),
         Mode::Filter => Line::from(Span::styled(
             format!("filter: {}▏", app.filter),
             Style::default().fg(Color::Cyan),
         )),
-        Mode::Normal | Mode::Help => {
-            let mut spans = Vec::new();
-            if app.busy {
-                spans.push(Span::styled(
-                    format!("{} ", SPINNER[app.spinner % SPINNER.len()]),
-                    Style::default().fg(Color::Cyan).bold(),
-                ));
-            }
-            spans.push(Span::styled(
-                app.status.clone(),
-                Style::default().fg(Color::Gray),
-            ));
-            Line::from(spans)
-        }
+        _ => Line::from(Span::styled(
+            app.status.clone(),
+            Style::default().fg(Color::Gray),
+        )),
     };
     let status_width = line.width();
     frame.render_widget(Paragraph::new(line), area);
@@ -435,9 +588,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if !matches!(app.mode, Mode::Normal) {
         return;
     }
-    // a sweep refuses all four, and the status line names the ones that do
+    // an alert refuses all four, and its hint line names the ones that do
     // respond — offering them here would be the UI saying two things (ADR 0001)
-    if app.loading {
+    if app.loading || alert_up {
         return;
     }
     // group before sort: it is the coarser control, so it is the one worth
@@ -492,11 +645,11 @@ fn hint_spans<'a>(hints: &[(&'a str, &'a str)], max: usize) -> Vec<Span<'a>> {
 /// keys that change what happens to mail. the ones that only change the
 /// *view* ride along on the status row instead — see `draw_status`.
 ///
-/// A sweep refuses every one of these, so the row goes blank for its length
-/// rather than offer keys that do nothing (ADR 0001). The status line above
-/// keeps naming the ones that still respond.
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    if app.loading {
+/// A sweep refuses every one of these, and so does an alert of any kind, so
+/// the row goes blank for its length rather than offer keys that do nothing
+/// (ADR 0001). The alert's hint line names the ones that still respond.
+fn draw_help(frame: &mut Frame, app: &App, area: Rect, alert_up: bool) {
+    if app.loading || alert_up {
         return;
     }
     const HINTS: &[(&str, &str)] = &[
@@ -638,6 +791,7 @@ mod tests {
     use crate::action_log::ActionLog;
     use crate::config::AccountConfig;
     use crate::stacks::{GroupBy, MsgMeta, SortBy, build_stacks};
+    use crate::ui::app::PendingAction;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1094,20 +1248,357 @@ mod tests {
         assert_eq!(commas(137_482), "137,482");
     }
 
-    #[test]
-    fn busy_status_shows_a_spinner_that_advances() {
-        let mut app = test_app();
-        app.status = "fetching inbox…".into();
+    /// the frame's rendered buffer at this size
+    fn buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
 
-        assert_eq!(status_text(&mut app), "fetching inbox…", "idle: no spinner");
+    /// every box-drawing corner in a rendered frame
+    fn corners(app: &mut App, w: u16, h: u16) -> Vec<(u16, u16)> {
+        let buf = buffer(app, w, h);
+        let mut found = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if matches!(buf[(x, y)].symbol(), "┌" | "┘") {
+                    found.push((x, y));
+                }
+            }
+        }
+        found
+    }
+
+    /// Where the alert sits, found by diffing against the same frame with the
+    /// alert taken down — the corners it adds are the box. Nothing here reads
+    /// the layout constants, so the geometry assertions are not circular.
+    fn alert_rect(app: &mut App, w: u16, h: u16) -> Rect {
+        let with = corners(app, w, h);
+        let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+        let alert = app.alert.take();
+        let without = corners(app, w, h);
+        app.mode = mode;
+        app.alert = alert;
+
+        let added: Vec<(u16, u16)> = with.into_iter().filter(|c| !without.contains(c)).collect();
+        let tl = *added
+            .iter()
+            .min_by_key(|(x, y)| (*y, *x))
+            .expect("the alert drew no box");
+        let br = *added
+            .iter()
+            .max_by_key(|(x, y)| (*y, *x))
+            .expect("the alert drew no box");
+        Rect {
+            x: tl.0,
+            y: tl.1,
+            width: br.0 - tl.0 + 1,
+            height: br.1 - tl.1 + 1,
+        }
+    }
+
+    /// the alert box's own rows, joined — nothing of the app behind it
+    fn alert_at(app: &mut App, w: u16, h: u16) -> String {
+        let r = alert_rect(app, w, h);
+        let buf = buffer(app, w, h);
+        (r.y..r.y + r.height)
+            .map(|y| {
+                (r.x..r.x + r.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn alert(app: &mut App) -> String {
+        alert_at(app, 100, 30)
+    }
+
+    fn sweeping(swept: usize, stacks: usize) -> Alert {
+        Alert::Sweeping {
+            starting: "connecting to me@x.com…".into(),
+            progress: Some(crate::imap_client::SweepProgress {
+                swept,
+                bound: 5_000,
+                stacks,
+            }),
+        }
+    }
+
+    /// ADR 0004: one slot, one size, one position — the thing the user learns
+    /// is where to look, and that must not depend on which state came up.
+    #[test]
+    fn the_three_alert_states_share_one_frame_in_one_position() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+
+        /// one row of ADR 0004's table, plus the state that produces it
+        struct Case {
+            title: &'static str,
+            headline: &'static str,
+            hint: &'static str,
+            set: fn(&mut App),
+        }
+        let states = [
+            Case {
+                title: "sweeping",
+                headline: "3,000 of 5,000 · 41 stacks",
+                hint: "q quit",
+                set: |app| {
+                    app.loading = true;
+                    app.mode = Mode::Normal;
+                    app.alert = Some(sweeping(3_000, 41));
+                },
+            },
+            Case {
+                title: "sweep failed",
+                headline: "stopped at 2,400 of 5,000",
+                hint: "m retry · any key to continue",
+                set: |app| {
+                    app.loading = false;
+                    app.mode = Mode::Normal;
+                    app.alert = Some(Alert::Failed("stopped at 2,400 of 5,000".into()));
+                },
+            },
+            Case {
+                title: "confirm",
+                headline: "Trash Alice (1 msgs)?",
+                hint: "y yes · n no",
+                set: |app| {
+                    app.loading = false;
+                    app.alert = None;
+                    app.mode = Mode::Confirm(PendingAction::Trash {
+                        stack_idxs: vec![0],
+                    });
+                },
+            },
+        ];
+
+        let mut geometry = Vec::new();
+        for Case {
+            title,
+            headline,
+            hint,
+            set,
+        } in states
+        {
+            set(&mut app);
+            let frame = alert(&mut app);
+            assert!(frame.contains(title), "no title {title:?} in\n{frame}");
+            assert!(frame.contains(headline), "no headline in\n{frame}");
+            assert!(frame.contains(hint), "no hint in\n{frame}");
+            geometry.push(alert_rect(&mut app, 100, 30));
+        }
+        assert_eq!(geometry[0], geometry[1], "sweeping vs failed moved the box");
+        assert_eq!(geometry[0], geometry[2], "the confirm moved the box");
+        assert_eq!(geometry[0].width, ALERT_W);
+        assert_eq!(geometry[0].height, ALERT_H);
+    }
+
+    /// the bar only rides along when there is progress behind it; a static bar
+    /// on a confirm would read as a stalled sweep
+    #[test]
+    fn only_the_sweeping_alert_carries_a_progress_bar() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.loading = true;
+        app.alert = Some(sweeping(2_500, 20));
+        let sweeping_box = alert(&mut app);
+        assert!(sweeping_box.contains('█'), "no bar:\n{sweeping_box}");
+        assert!(sweeping_box.contains('░'), "no remainder:\n{sweeping_box}");
+
+        app.loading = false;
+        app.alert = Some(Alert::Failed("stopped at 2,400 of 5,000".into()));
+        let failed = alert(&mut app);
+        assert!(
+            !failed.contains('█'),
+            "a failure has no progress:\n{failed}"
+        );
+    }
+
+    /// the bar carries progress; the spinner carries liveness. A bar that has
+    /// not moved for two seconds is ambiguous in a way a stopped spinner isn't.
+    #[test]
+    fn the_spinner_keeps_turning_next_to_the_bar() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.loading = true;
+        app.alert = Some(sweeping(3_000, 41));
+
+        let first = alert(&mut app);
+        app.tick_spinner();
+        let second = alert(&mut app);
+        assert_ne!(first, second, "the spinner frame did not advance");
+        assert!(
+            SPINNER.iter().any(|s| first.contains(s)),
+            "no spinner beside the bar:\n{first}"
+        );
+    }
+
+    /// ADR 0004: the box is 60 columns because the first sweep draws it over a
+    /// blank screen, where a small box reads as a crash rather than as progress
+    #[test]
+    fn the_first_sweep_draws_a_full_width_alert_over_an_empty_stack_pane() {
+        let mut app = app_with(vec![], GroupBy::Sender);
+        app.accounts[0].loaded = false;
+        app.loading = true;
+        app.alert = Some(Alert::Sweeping {
+            starting: "connecting to me@x.com…".into(),
+            progress: None,
+        });
+
+        let rect = alert_rect(&mut app, 100, 30);
+        assert_eq!((rect.width, rect.height), (ALERT_W, ALERT_H), "box shrank");
+        let frame = alert(&mut app);
+        assert!(
+            frame.contains("connecting to me@x.com…"),
+            "before the first chunk the alert still says what it is doing:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn the_alert_still_fits_at_80x24() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.loading = true;
+        app.alert = Some(sweeping(3_000, 41));
+
+        let rect = alert_rect(&mut app, MIN_WIDTH, MIN_HEIGHT);
+        assert_eq!(rect.height, ALERT_H, "the box lost rows at 80x24");
+        assert!(
+            rect.x + rect.width <= MIN_WIDTH && rect.y + rect.height <= MIN_HEIGHT,
+            "the box ran off an 80x24 screen: {rect:?}"
+        );
+        let frame = alert_at(&mut app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(frame.contains("3,000 of 5,000 · 41 stacks"), "{frame}");
+        assert!(frame.contains("q quit"), "{frame}");
+    }
+
+    /// the style of every cell outside `r`
+    fn outside(app: &mut App, r: Rect) -> Vec<Style> {
+        let buf = buffer(app, 100, 30);
+        let mut styles = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let inside = x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+                if !inside {
+                    styles.push(buf[(x, y)].style());
+                }
+            }
+        }
+        styles
+    }
+
+    /// the same cells with nothing in the alert slot — the baseline the
+    /// repaint is measured against
+    fn undisturbed(app: &mut App, r: Rect) -> Vec<Style> {
+        let alert = app.alert.take();
+        let styles = outside(app, r);
+        app.alert = alert;
+        styles
+    }
+
+    /// ADR 0004: the foreground behind the alert is overwritten, not `DIM`ed —
+    /// terminals are free to ignore `DIM`
+    #[test]
+    fn the_screen_behind_the_alert_is_greyed_by_colour_not_by_the_dim_bit() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.loading = true;
+        app.alert = Some(sweeping(3_000, 41));
+        let r = alert_rect(&mut app, 100, 30);
+
+        let behind = outside(&mut app, r);
+        assert!(
+            behind.iter().all(|s| s.fg == Some(MUTED)),
+            "something behind the alert kept its own colour"
+        );
+        assert!(
+            behind
+                .iter()
+                .all(|s| !s.add_modifier.contains(Modifier::DIM)),
+            "DIM is not the mechanism"
+        );
+        assert_ne!(behind, undisturbed(&mut app, r), "nothing was repainted");
+    }
+
+    /// Under NO_COLOR the border and the `Clear` carry the whole job, which is
+    /// the reason the box is large. #5 takes this over with the theme module.
+    #[test]
+    fn no_color_drops_the_dimming_and_the_alerts_colour() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.no_color = true;
+        app.loading = true;
+        app.alert = Some(sweeping(3_000, 41));
+        let r = alert_rect(&mut app, 100, 30);
+
+        assert_eq!(
+            outside(&mut app, r),
+            undisturbed(&mut app, r),
+            "NO_COLOR must leave what is behind the alert exactly as it was"
+        );
+
+        let frame = alert(&mut app);
+        assert!(
+            frame.contains("sweeping"),
+            "the box is still there:\n{frame}"
+        );
+        assert!(frame.contains("3,000 of 5,000 · 41 stacks"), "{frame}");
+
+        // and the box itself carries no colour of its own
+        let buf = buffer(&mut app, 100, 30);
+        let border: Vec<Style> = (r.x..r.x + r.width)
+            .map(|x| buf[(x, r.y)].style())
+            .collect();
+        assert!(
+            border
+                .iter()
+                .all(|s| s.fg.is_none_or(|c| c == Color::Reset)),
+            "the border kept a colour under NO_COLOR: {border:?}"
+        );
+    }
+
+    /// An alert answers the next key itself, whichever it is. Leaving the hint
+    /// rows up under it would have the UI offering keys it is about to swallow
+    /// — the same thing ADR 0001 takes them down for during a sweep.
+    #[test]
+    fn an_alert_takes_down_the_hint_rows_for_the_keys_it_swallows() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        assert!(footer(&mut app, 80).contains("trash"));
+        assert!(status_row(&mut app).contains("m more"));
+
+        // a failed sweep is not `loading`, so only the alert can take them down
+        app.alert = Some(Alert::Failed("stopped at 2,400 of 5,000".into()));
+        assert_eq!(footer(&mut app, 80), "", "no action keys under the alert");
+        assert!(
+            !status_row(&mut app).contains("m more"),
+            "nor the view keys"
+        );
+
+        app.alert = None;
+        app.mode = Mode::Confirm(PendingAction::Trash {
+            stack_idxs: vec![0],
+        });
+        assert_eq!(footer(&mut app, 80), "", "nor under a confirm");
+    }
+
+    /// ADR 0004: the spinner and the confirm both leave the status row. What
+    /// stays is the idle text and the view-state keys.
+    #[test]
+    fn the_status_row_keeps_only_its_idle_text() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.status = "fetching inbox…".into();
+        assert_eq!(status_text(&mut app), "fetching inbox…");
 
         app.busy = true;
-        let first = status_text(&mut app);
-        app.tick_spinner();
-        let second = status_text(&mut app);
+        assert_eq!(
+            status_text(&mut app),
+            "fetching inbox…",
+            "the spinner moved to the alert"
+        );
 
-        assert!(first.ends_with("fetching inbox…"));
-        assert!(SPINNER.contains(&&first[..first.len() - "fetching inbox…".len() - 1]));
-        assert_ne!(first, second, "spinner frame advances with the tick");
+        app.busy = false;
+        app.mode = Mode::Confirm(PendingAction::Trash {
+            stack_idxs: vec![0],
+        });
+        let row = status_row(&mut app);
+        assert!(!row.contains("[y/n]"), "the confirm moved too: {row:?}");
+        assert!(!row.contains("g group"), "a prompt still owns the row");
     }
 }
