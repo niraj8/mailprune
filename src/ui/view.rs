@@ -714,7 +714,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect, alert_up: bool) {
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     const _: () = assert!(
         WINDOW == 5000,
-        "the `m` help row says 5,000; the README (#32) still says 40 senders"
+        "the `m` help row and the README both say 5,000; update them with WINDOW"
     );
     const SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         (
@@ -1177,6 +1177,36 @@ mod tests {
         app
     }
 
+    /// The README's sample screen is an 80-column render — the width GitHub
+    /// shows without a scrollbar — so it has to keep the geometry this code
+    /// draws. Its content is illustrative; its frame is not.
+    #[test]
+    fn the_readme_screenshot_is_still_an_80_column_frame() {
+        let readme = include_str!("../../README.md");
+        let block = readme
+            .split("```")
+            .find(|b| b.contains("mailprune") && b.contains('┌'))
+            .expect("the sample screen");
+        let rows: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        // the bar rows keep their trailing blanks only where a border needs
+        // them, so a text row may be short — never wide
+        for row in &rows {
+            assert!(row.chars().count() <= 80, "wider than 80: {row:?}");
+        }
+        // Percentage(45)/Percentage(55) of 80 columns puts the stacks pane's
+        // edges at 0 and 35, and the detail pane's at 36 and 79
+        for row in rows.iter().filter(|r| r.starts_with(['┌', '│', '└'])) {
+            let edges: Vec<char> = row.chars().collect();
+            for col in [0, 35, 36, 79] {
+                assert!(
+                    "┌┐└┘│".contains(edges[col]),
+                    "no pane edge at column {col}: {row:?}"
+                );
+            }
+        }
+    }
+
     /// The count on the title is the window, not what happens to be loaded: a
     /// title reporting only the loaded messages says "1" whether the sweep
     /// reached 5,000 messages back or the mailbox holds one.
@@ -1253,6 +1283,32 @@ mod tests {
         let rows = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join("\n");
         assert!(!rows.contains('~'), "{rows:?}");
         assert!(rows.contains("Alice") && rows.contains("Bob"));
+    }
+
+    /// Each account's window is its own 5,000 UIDs — a shared budget would
+    /// make one account's window depend on another's mail — so the pane title
+    /// has to report the window of the account it is showing.
+    #[test]
+    fn each_account_reports_its_own_window() {
+        let mut app = app_with_a_bounded_window();
+        let mut second = crate::ui::app::AccountView::new(AccountConfig {
+            name: "other".into(),
+            email: "other@x.com".into(),
+            imap_host: "imap".into(),
+            smtp_host: "smtp".into(),
+        });
+        second.total = 3_120;
+        second.back = 3_120;
+        second.reached_end = true;
+        second.visited = true;
+        second.loaded = true;
+        app.accounts.push(second);
+
+        assert!(pane_title(&mut app, 200).contains("newest 5,000 of 137,482 msgs"));
+        app.active = 1;
+        let title = pane_title(&mut app, 200);
+        assert!(title.contains("all 3,120 msgs"), "{title:?}");
+        assert!(!title.contains("137,482"), "{title:?}");
     }
 
     /// Both numbers are about mail that is still there, so both fall as it is
