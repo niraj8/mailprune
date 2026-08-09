@@ -9,7 +9,7 @@ A group of messages presented as one row and decided on as a unit. Grouped by se
 _Avoid_: Bundle, cluster, thread, conversation
 
 **Sweep**:
-The walk through a mailbox, newest message first, that turns mail into stacks. It reads message headers in chunks of 1,000 and rebuilds the stacks once, when the window is complete — nothing appears while it runs. It holds the keyboard for its whole length; the alert's counter is the only thing that moves.
+The walk through a mailbox, newest message first, that turns mail into stacks. It reads message headers in chunks of 1,000 and rebuilds the stacks once, when the window is complete — nothing appears while it runs. It holds the keyboard for its whole length; the alert — its spinner, its counter and its bar — is the only thing that moves.
 _Avoid_: Load, fetch, scan, batch, discovery
 
 **Window**:

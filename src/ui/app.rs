@@ -68,35 +68,41 @@ impl PendingAction {
     /// does, and the box saying the same thing twice is the ADR 0004 layout
     /// wasting one of its three lines.
     pub fn prompt(&self, acct: &AccountView) -> String {
-        let summary = |idxs: &[usize]| -> String {
-            let msgs: usize = idxs.iter().map(|&i| acct.stacks[i].msgs.len()).sum();
-            if idxs.len() == 1 {
-                format!("{} ({} msgs)", acct.stacks[idxs[0]].display_name, msgs)
-            } else {
-                format!("{} stacks ({} msgs)", idxs.len(), msgs)
+        /// "DoorDash", or "3 stacks" once it is more than one
+        fn whose(acct: &AccountView, idxs: &[usize]) -> String {
+            match idxs {
+                [i] => acct.stacks[*i].display_name.clone(),
+                _ => format!("{} stacks", idxs.len()),
             }
+        }
+        // "400 messages from DoorDash" — what moves, and where it moves from.
+        // #30 adds the mailbox-wide count and the "(N in view)" that goes with
+        // it; until then the count is what the window holds.
+        let mail = |idxs: &[usize]| -> String {
+            let n: usize = idxs.iter().map(|&i| acct.stacks[i].msgs.len()).sum();
+            let plural = if n == 1 { "" } else { "s" };
+            format!("{} message{plural} from {}", commas(n), whose(acct, idxs))
         };
         match self {
-            PendingAction::Trash { stack_idxs } => {
-                format!("Trash {}?", summary(stack_idxs))
-            }
-            PendingAction::Archive { stack_idxs } => {
-                format!("Archive {}?", summary(stack_idxs))
-            }
+            PendingAction::Trash { stack_idxs } => format!("trash {}?", mail(stack_idxs)),
+            PendingAction::Archive { stack_idxs } => format!("archive {}?", mail(stack_idxs)),
             PendingAction::Unsubscribe { stack_idxs } => {
+                // unsubscribing is per sender, not per message, so this one
+                // counts senders rather than the mail behind them
+                let who = whose(acct, stack_idxs);
                 if let [i] = stack_idxs[..] {
                     let via = acct.stacks[i]
                         .unsubscribe_source()
                         .and_then(unsubscribe::pick_method)
                         .map(|m| m.describe())
                         .unwrap_or("?");
-                    format!("Unsubscribe from {} via {via}?", summary(stack_idxs))
+                    format!("unsubscribe from {who} via {via}?")
                 } else {
-                    format!("Unsubscribe from {}?", summary(stack_idxs))
+                    format!("unsubscribe from {who}?")
                 }
             }
             PendingAction::TrashAfterUnsub { stack_idxs } => {
-                format!("Done. Also trash {}?", summary(stack_idxs))
+                format!("unsubscribed — also trash {}?", mail(stack_idxs))
             }
         }
     }
@@ -1091,6 +1097,11 @@ impl App {
                     // half that worked. `back` stopped where the sweep did, so
                     // `m` retries the remainder of this window before it
                     // advances (ADR 0003).
+                    // `anchored` as well as `short`, because "stopped at 0 of
+                    // 5,000" would be a claim about a mailbox this sweep never
+                    // counted. Today an unanchored sweep also has `bound == 0`
+                    // and so is never short, but that is the task's choice of
+                    // `Sweep::default()`, not something this arm should rest on.
                     Err(e) if sweep.anchored && sweep.short() => {
                         // the count goes in the alert, where it cannot be
                         // missed; the reason stays in the status row, which is

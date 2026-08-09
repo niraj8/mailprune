@@ -423,10 +423,16 @@ struct AlertView {
     title: &'static str,
     colour: Color,
     headline: String,
-    /// `(done, of)` when there is progress to show. The spinner rides along
-    /// with it: the bar carries progress, the spinner carries liveness, and a
-    /// bar that has not moved in two seconds is ambiguous where a stopped
-    /// spinner is not (ADR 0004).
+    /// The state is one the user is waiting on, so the headline is spun. This
+    /// is not `bar.is_some()`: a sweep that has not reported its first chunk
+    /// yet has nothing to fill a bar with, and that is exactly the moment — an
+    /// alert alone on a blank screen — that has to read as progress rather than
+    /// as a crash (ADR 0004).
+    spins: bool,
+    /// `(done, of)` when there is progress to show. It rides *alongside* the
+    /// spinner rather than replacing it: the bar carries progress, the spinner
+    /// carries liveness, and a bar that has not moved in two seconds is
+    /// ambiguous where a stopped spinner is not (ADR 0004).
     bar: Option<(usize, usize)>,
     /// the keys that work right now, and only those
     hint: &'static str,
@@ -441,6 +447,8 @@ fn alert_view(app: &App) -> Option<AlertView> {
             title: " confirm ",
             colour: Color::Yellow,
             headline: action.prompt(app.account()),
+            // the app is waiting on the user here, not the other way round
+            spins: false,
             bar: None,
             hint: "y yes · n no",
         });
@@ -460,6 +468,7 @@ fn alert_view(app: &App) -> Option<AlertView> {
                     )
                 },
             ),
+            spins: true,
             bar: progress.map(|p| (p.swept, p.bound)),
             hint: "q quit",
         }),
@@ -467,6 +476,7 @@ fn alert_view(app: &App) -> Option<AlertView> {
             title: " sweep failed ",
             colour: Color::Red,
             headline: headline.clone(),
+            spins: false,
             bar: None,
             hint: "m retry · any key to continue",
         }),
@@ -481,11 +491,8 @@ fn draw_alert(frame: &mut Frame, app: &App, alert: &AlertView) {
     // Under NO_COLOR the box's border and its `Clear` carry the whole job of
     // separating the alert from the app behind it — which is the reason the
     // box is large. #5 replaces both of these with the theme module.
-    let colour = if app.no_color {
-        Color::Reset
-    } else {
-        alert.colour
-    };
+    let coloured = |c: Color| if app.no_color { Color::Reset } else { c };
+    let colour = coloured(alert.colour);
     if !app.no_color {
         let whole = frame.area();
         frame
@@ -515,14 +522,15 @@ fn draw_alert(frame: &mut Frame, app: &App, alert: &AlertView) {
         .split(inner);
 
     let width = inner.width as usize;
-    let headline = match alert.bar {
+    let headline = if alert.spins {
         // the spinner costs two columns of the headline's budget
-        Some(_) => format!(
+        format!(
             "{} {}",
             SPINNER[app.spinner % SPINNER.len()],
             truncate(&alert.headline, width.saturating_sub(2))
-        ),
-        None => truncate(&alert.headline, width),
+        )
+    } else {
+        truncate(&alert.headline, width)
     };
     frame.render_widget(
         Paragraph::new(headline)
@@ -539,11 +547,7 @@ fn draw_alert(frame: &mut Frame, app: &App, alert: &AlertView) {
     frame.render_widget(
         Paragraph::new(alert.hint)
             .alignment(Alignment::Center)
-            .style(Style::default().fg(if app.no_color {
-                Color::Reset
-            } else {
-                Color::Gray
-            })),
+            .style(Style::default().fg(coloured(Color::Gray))),
         rows[3],
     );
 }
@@ -567,17 +571,31 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, alert_up: bool) {
-    // the spinner and the confirm both moved to the alert (ADR 0004); what is
-    // left is the idle text and, on the right, the view-state keys
+    // the sweep's spinner and the confirm both moved to the alert (ADR 0004);
+    // what is left is the idle text and, on the right, the view-state keys
     let line = match &app.mode {
         Mode::Filter => Line::from(Span::styled(
             format!("filter: {}▏", app.filter),
             Style::default().fg(Color::Cyan),
         )),
-        _ => Line::from(Span::styled(
-            app.status.clone(),
-            Style::default().fg(Color::Gray),
-        )),
+        Mode::Normal | Mode::Confirm(_) | Mode::Help => {
+            let mut spans = Vec::new();
+            // An in-flight `d`/`e`/`r`/`u` is the one wait the alert does not
+            // cover — ADR 0004 gives it three states, and none of them is an
+            // action mid-flight. Without this the row would say "trashing 400
+            // messages…" with nothing on screen moving behind it.
+            if app.busy && !alert_up {
+                spans.push(Span::styled(
+                    format!("{} ", SPINNER[app.spinner % SPINNER.len()]),
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
+            }
+            spans.push(Span::styled(
+                app.status.clone(),
+                Style::default().fg(Color::Gray),
+            ));
+            Line::from(spans)
+        }
     };
     let status_width = line.width();
     frame.render_widget(Paragraph::new(line), area);
@@ -1362,7 +1380,7 @@ mod tests {
             },
             Case {
                 title: "confirm",
-                headline: "Trash Alice (1 msgs)?",
+                headline: "trash 1 message from Alice?",
                 hint: "y yes · n no",
                 set: |app| {
                     app.loading = false;
@@ -1433,10 +1451,76 @@ mod tests {
         );
     }
 
+    /// The moment with nothing to put in the bar is the moment the spinner is
+    /// carrying the whole box, so it cannot be keyed off the bar: a sweep that
+    /// has not reported its first chunk would sit there wholly static, over an
+    /// empty screen, which is the "reads as a crash" ADR 0004 rules out.
+    #[test]
+    fn the_alert_spins_before_the_first_chunk_gives_it_a_bar() {
+        let mut app = app_with(vec![], GroupBy::Sender);
+        app.loading = true;
+        app.alert = Some(Alert::Sweeping {
+            starting: "connecting to me@x.com…".into(),
+            progress: None,
+        });
+
+        let first = alert(&mut app);
+        app.tick_spinner();
+        assert!(!first.contains('█'), "no bar yet:\n{first}");
+        assert!(
+            SPINNER.iter().any(|s| first.contains(s)),
+            "a barless sweep must still move:\n{first}"
+        );
+        assert_ne!(first, alert(&mut app), "the frame did not advance");
+    }
+
+    /// the states the user is answering are not states the user is waiting on
+    #[test]
+    fn the_alert_holds_still_when_it_is_waiting_on_the_user() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        for state in ["failed", "confirm"] {
+            if state == "failed" {
+                app.alert = Some(Alert::Failed("stopped at 2,400 of 5,000".into()));
+            } else {
+                app.alert = None;
+                app.mode = Mode::Confirm(PendingAction::Trash {
+                    stack_idxs: vec![0],
+                });
+            }
+            let before = alert(&mut app);
+            app.tick_spinner();
+            assert_eq!(before, alert(&mut app), "{state} should not spin");
+            assert!(
+                !SPINNER.iter().any(|s| before.contains(s)),
+                "{state} has no spinner:\n{before}"
+            );
+        }
+    }
+
+    /// An in-flight `d`/`e`/`r`/`u` is the one wait with no alert behind it —
+    /// ADR 0004 gives the box three states and none of them is an action
+    /// mid-flight, so the status row keeps a spinner for exactly that case.
+    #[test]
+    fn an_action_in_flight_keeps_its_spinner_on_the_status_row() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        app.status = "trashing 400 messages…".into();
+        assert_eq!(status_text(&mut app), "trashing 400 messages…");
+
+        app.busy = true;
+        let spun = status_text(&mut app);
+        assert!(spun.ends_with("trashing 400 messages…"), "{spun:?}");
+        assert!(
+            SPINNER.iter().any(|s| spun.starts_with(s)),
+            "nothing on screen moves during a trash: {spun:?}"
+        );
+        app.tick_spinner();
+        assert_ne!(spun, status_text(&mut app), "the frame advances");
+    }
+
     /// ADR 0004: the box is 60 columns because the first sweep draws it over a
     /// blank screen, where a small box reads as a crash rather than as progress
     #[test]
-    fn the_first_sweep_draws_a_full_width_alert_over_an_empty_stack_pane() {
+    fn the_first_sweep_draws_the_alert_at_full_size_over_an_empty_stack_pane() {
         let mut app = app_with(vec![], GroupBy::Sender);
         app.accounts[0].loaded = false;
         app.loading = true;
@@ -1583,17 +1667,22 @@ mod tests {
     #[test]
     fn the_status_row_keeps_only_its_idle_text() {
         let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
-        app.status = "fetching inbox…".into();
-        assert_eq!(status_text(&mut app), "fetching inbox…");
-
-        app.busy = true;
+        app.status = "me@x.com: 1 of 1 messages in 1 stacks".into();
         assert_eq!(
             status_text(&mut app),
-            "fetching inbox…",
-            "the spinner moved to the alert"
+            "me@x.com: 1 of 1 messages in 1 stacks"
         );
 
-        app.busy = false;
+        // a sweep's spinner is the alert's; the row keeps only its own text
+        app.loading = true;
+        app.alert = Some(sweeping(3_000, 41));
+        assert_eq!(
+            status_text(&mut app),
+            "me@x.com: 1 of 1 messages in 1 stacks"
+        );
+
+        app.loading = false;
+        app.alert = None;
         app.mode = Mode::Confirm(PendingAction::Trash {
             stack_idxs: vec![0],
         });
