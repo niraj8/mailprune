@@ -642,7 +642,6 @@ mod tests {
                     .collect(),
             ))
         }
-
     }
 
     /// one sweep, with the progress it reported along the way
@@ -701,8 +700,8 @@ mod tests {
     /// explain (ADR 0003).
     #[tokio::test]
     async fn m_after_a_short_window_reads_the_remainder_before_it_advances() {
-        let mut mailbox = FakeMailbox::of_size(20_000)
-            .fetches_answer(&[Answer::Ok, Answer::Ok, Answer::Refuse]);
+        let mut mailbox =
+            FakeMailbox::of_size(20_000).fetches_answer(&[Answer::Ok, Answer::Ok, Answer::Refuse]);
         let (short, result, _) = swept(&mut mailbox, 0).await;
         assert!(result.is_err());
         assert_eq!(short.swept, 2_000, "the window stopped two chunks in");

@@ -1866,7 +1866,10 @@ mod tests {
         app.prune_window(&[a], 400);
 
         assert_eq!(app.accounts[0].total, 137_082, "all 400 left the mailbox");
-        assert_eq!(app.accounts[0].back, 4_998, "two of them were in the window");
+        assert_eq!(
+            app.accounts[0].back, 4_998,
+            "two of them were in the window"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1890,9 +1893,15 @@ mod tests {
         assert!(!acct.loaded);
         assert_eq!(acct.selected, 0);
         assert!(acct.marked.is_empty());
-        assert!(app.loading, "and it is an inert-TUI event like any other sweep");
+        assert!(
+            app.loading,
+            "and it is an inert-TUI event like any other sweep"
+        );
         assert!(matches!(app.alert, Some(Alert::Sweeping { .. })));
-        assert!(acct.client.is_none(), "and it dials again rather than reusing");
+        assert!(
+            acct.client.is_none(),
+            "and it dials again rather than reusing"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2103,7 +2112,10 @@ mod tests {
 
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.active, 1);
-        assert!(app.loading, "the first Tab to it sweeps, inert like any sweep");
+        assert!(
+            app.loading,
+            "the first Tab to it sweeps, inert like any sweep"
+        );
         assert!(app.accounts[1].visited);
 
         // its window lands, its own 5,000 rather than a share of anything
