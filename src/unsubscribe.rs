@@ -44,20 +44,18 @@ pub fn pick_method(msg: &MsgMeta) -> Option<Method> {
             };
             let mut subject = String::from("unsubscribe");
             for kv in query.split('&') {
-                if let Some((k, v)) = kv.split_once('=') {
-                    if k.eq_ignore_ascii_case("subject") {
+                if let Some((k, v)) = kv.split_once('=')
+                    && k.eq_ignore_ascii_case("subject") {
                         subject = urldecode(v);
                     }
-                }
             }
             mailto.get_or_insert(Method::Mailto { to, subject });
         }
     }
-    if msg.one_click {
-        if let Some(url) = &https_url {
+    if msg.one_click
+        && let Some(url) = &https_url {
             return Some(Method::OneClick(url.clone()));
         }
-    }
     // prefer mailto over browser: fully automatic
     mailto.or(https_url.map(Method::Browser))
 }
