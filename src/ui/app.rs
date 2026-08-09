@@ -29,6 +29,16 @@ pub enum Alert {
     Failed(String),
 }
 
+/// May a sweep of this kind carry on with the session it was handed?
+///
+/// Widening does — it is the same connection mid-triage, and re-dialling for
+/// every `m` would put a login in front of a key the user presses often. A
+/// reset does not: `R` is the reconnect key, so the one thing it must not do
+/// is keep a session whose death is the reason it was pressed.
+fn reuses_session(kind: Load) -> bool {
+    matches!(kind, Load::More)
+}
+
 /// the two keys that leave, live in every state including a running sweep
 fn is_quit(key: KeyEvent) -> bool {
     matches!(
@@ -538,9 +548,14 @@ impl App {
         let acct = &mut self.accounts[acct_idx];
         let cfg = acct.cfg.clone();
         let cached_password = acct.password.clone();
-        // a live session is reused on refresh; taking it keeps the account from
-        // being used by two paths at once
-        let existing = acct.client.take();
+        // Taking it keeps the account from being used by two paths at once; a
+        // reset then throws it away rather than reusing it, because `R`
+        // reconnects (ADR 0002). It is the recovery path after a dead socket,
+        // and a socket that died without saying so answers every command by
+        // not answering — reusing it spends the timeout again and lands back
+        // here. Dropped rather than logged out: there may be nothing on the
+        // other end to say goodbye to.
+        let existing = acct.client.take().filter(|_| reuses_session(kind));
         if reset {
             acct.stacks.clear();
             acct.total = 0;
@@ -1654,7 +1669,18 @@ mod tests {
         assert!(acct.marked.is_empty());
         assert!(app.loading, "and it is an inert-TUI event like any other sweep");
         assert!(matches!(app.alert, Some(Alert::Sweeping { .. })));
+        assert!(acct.client.is_none(), "and it dials again rather than reusing");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `R` is the reconnect key, so the one thing it must not do is keep a
+    /// session whose death is the reason it was pressed. `m` is mid-triage on
+    /// a connection that is answering, and re-dialling for every widen would
+    /// put a login in front of a key the user presses often.
+    #[test]
+    fn only_a_widen_carries_on_with_the_session_it_was_handed() {
+        assert!(reuses_session(Load::More));
+        assert!(!reuses_session(Load::Reset));
     }
 
     #[test]
