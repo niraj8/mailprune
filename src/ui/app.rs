@@ -590,11 +590,14 @@ impl App {
     /// status line describing an account's stacks as they stand now
     fn account_summary(&self, idx: usize) -> String {
         let acct = &self.accounts[idx];
+        // the same two numbers the pane title carries, so they are grouped the
+        // same way — one row reading 137,482 above another reading 137482 is
+        // the screen contradicting itself
         format!(
             "{}: {} of {} messages in {} stacks",
             acct.cfg.email,
-            acct.loaded_messages(),
-            acct.inbox_total(),
+            commas(acct.loaded_messages()),
+            commas(acct.inbox_total()),
             acct.stacks.len()
         )
     }
@@ -2044,6 +2047,28 @@ mod tests {
 
         assert_eq!(app.active, 1);
         assert_eq!(app.status, "other@x.com: 1 of 1 messages in 1 stacks");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the status row and the pane title state the same two numbers, so a
+    /// six-figure mailbox has to read the same way in both
+    #[test]
+    fn the_summary_groups_its_digits_like_the_title_does() {
+        let path = temp_log("summary-commas");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let acct = app.account_mut();
+        acct.total = 137_482;
+        acct.stacks = build_stacks(
+            (1..=5_000)
+                .map(|uid| msg(uid, &format!("s{}@x.com", uid % 42), "hi"))
+                .collect(),
+            GroupBy::Sender,
+            SortBy::Count,
+        );
+
+        let summary = app.account_summary(0);
+
+        assert!(summary.contains("5,000 of 137,482 messages"), "{summary:?}");
         let _ = std::fs::remove_file(&path);
     }
 

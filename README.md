@@ -14,26 +14,53 @@ The fastest way to inbox zero:
 4. `y` again at the "also trash?" prompt.
 5. `g` to regroup by sender+subject and repeat for noisy notification types
    from senders you otherwise keep.
-6. `m` when the pane runs dry, and go again.
+6. `m` when the pane runs dry — it sweeps the next 5,000 messages — and go again.
 
 ```
- mailprune  personal  work                          12 trashed · 40 archived · 3 unsubbed
-┌ stacks (42) · 873 of 137,482 msgs · by sender · sort read rate · 2 marked ┐┌ DoorDash <no-reply@doordash.com> · unsub: one-click POST ┐
-│▌ 214   0% U DoorDash (12 new)                                             ││ 2026-06-09 ● Your order is on the way                     │
-│▌ 120   2% U Medium Daily Digest                                           ││ 2026-06-08   Craving something new?                       │
-│   76  31% U LinkedIn                                                      ││ 2026-06-07   Weekend deals near you                       │
-│   31  94%   GitHub                                                        ││ ...                                                       │
-└───────────────────────────────────────────────────────────────────────────┘└───────────────────────────────────────────────────────────┘
- personal: 873 of 137,482 messages in 42 stacks                   m more  g group  s sort  Tab acct
+ mailprune   personal  work               12 trashed · 40 archived · 3 unsubbed
+┌ 42 · sender · read rate · 2▌ ────┐┌ DoorDash <no-reply@doordash.com> · unsub:┐
+│▌ 214   0% U DoorDash (214 new)   ││2026-06-09 ● Your order is on the way     │
+│▌ 120   1% U Medium Dai… (118 new)││2026-06-08 ● Your driver is nearby        │
+│   76  31% U LinkedIn (52 new)    ││2026-06-07 ● Weekend deals near you       │
+│   31  93%   GitHub (2 new)       ││2026-06-05 ● 30% off your next order      │
+└──────────────────────────────────┘└──────────────────────────────────────────┘
+you@gmail.com: 5,000 of 137,482 messages in 42 stacks   m more  g group  s sort
  j/k move  Space mark  d trash  e archive  r read  u unsub  / filter  ? keys
 ```
 
-The stacks on screen are the 40 most recent senders, not your whole mailbox —
-press `m` for the next 40. But each **count is every message that sender has in
-your inbox**, not just the ones listed, so `d` trashes all of them. A count
-shown as `~214` means the server refused part of the listing: the sender has
-more than that, mailprune only has 214, and `d` will clear only those. Press
-`R` to reload.
+## The window, and what a stack acts on
+
+mailprune sweeps the **newest 5,000 messages** in your inbox and stacks those.
+That is the window. Give the pane the width and its title says so —
+`newest 5,000 of 137,482 msgs`, or `all 3,120 msgs` once a sweep has reached the
+oldest message in the mailbox. (The 80-column screenshot above is too narrow for
+it: the title spends what it has on the group and sort state instead.) `m`
+sweeps the next 5,000 and folds them into the stacks already on screen; `R`
+reconnects and re-sweeps from scratch.
+
+The number on a row is that sender's mail **inside the window**. Trashing and
+archiving are not limited to the window: `d` and `e` search your whole inbox
+for that sender and act on everything they find. So the confirm prompt asks
+about a bigger number than the row shows —
+
+```
+trash 1,204 messages from DoorDash (214 in view)?
+```
+
+— and 1,204 is the one that moves. Confirm on that. If the server refuses the
+search, the action still runs but reaches only the mail in view, and the status
+line says so.
+
+Two exceptions. Under `g` (sender+subject) a row is one kind of mail from a
+sender rather than the sender, and IMAP cannot search on that subject, so `d`
+and `e` act on the window's mail only — the prompt's two numbers agree because
+they are the same number. And `r` (mark read) always stays on the window's
+mail: it moves nothing out of the mailbox, so it asks nothing.
+
+`u` unsubscribes per sender; the "also trash?" prompt after it states a
+mailbox-wide count like any other trash.
+
+The internals are in `docs/adr/0001`–`0004`.
 
 ## Install
 
