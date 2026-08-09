@@ -39,6 +39,21 @@ fn reuses_session(kind: Load) -> bool {
     matches!(kind, Load::More)
 }
 
+/// What an outcome adds when the server refused to fan a sender out: the
+/// action ran, but for that sender it reached only the mail already in view.
+/// This is **partial** — an action-time error, never a state a stack sits in,
+/// because nothing is fanned out until the user acts (ADR 0002).
+fn only_in_view(refused: &[String]) -> String {
+    match refused {
+        [] => String::new(),
+        [one] => format!(" — {one}'s search was refused, so only its mail in view"),
+        many => format!(
+            " — {} searches were refused, so only their mail in view",
+            many.len()
+        ),
+    }
+}
+
 /// the two keys that leave, live in every state including a running sweep
 fn is_quit(key: KeyEvent) -> bool {
     matches!(
@@ -56,13 +71,44 @@ pub enum Mode {
     Help,
 }
 
+/// What an action's fan-out found: every message the targeted senders still
+/// have in the mailbox, however far back the window reaches.
+///
+/// Produced by the `SEARCH` the user's keypress runs, before the confirm
+/// prompt — the round trip the action needs anyway, moved ahead of the question
+/// so the prompt can state a real number (ADR 0002).
+#[derive(Debug, Clone, Default)]
+pub struct FanOut {
+    /// the set the action works on
+    pub uids: Vec<u32>,
+    /// how many of them the window was already showing — the `(N in view)` the
+    /// prompt states alongside the mailbox-wide count
+    pub in_view: usize,
+    /// Senders whose `SEARCH` the server refused. The action still runs, but
+    /// for them it reaches only the mail already in view — which is what
+    /// **partial** means now: an outcome an action reports, never a state a
+    /// stack sits in.
+    pub refused: Vec<String>,
+}
+
+/// what a fan-out is being run for — the confirm it opens once it lands
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanFor {
+    Trash,
+    Archive,
+    /// the "also trash?" offer chained off a successful unsubscribe
+    TrashAfterUnsub,
+}
+
 #[derive(Debug, Clone)]
 pub enum PendingAction {
     Trash {
         stack_idxs: Vec<usize>,
+        fan: FanOut,
     },
     Archive {
         stack_idxs: Vec<usize>,
+        fan: FanOut,
     },
     Unsubscribe {
         stack_idxs: Vec<usize>,
@@ -70,6 +116,7 @@ pub enum PendingAction {
     /// after a successful unsubscribe, offer to trash the stacks too
     TrashAfterUnsub {
         stack_idxs: Vec<usize>,
+        fan: FanOut,
     },
 }
 
@@ -85,17 +132,26 @@ impl PendingAction {
                 _ => format!("{} stacks", idxs.len()),
             }
         }
-        // "400 messages from DoorDash" — what moves, and where it moves from.
-        // #30 adds the mailbox-wide count and the "(N in view)" that goes with
-        // it; until then the count is what the window holds.
-        let mail = |idxs: &[usize]| -> String {
-            let n: usize = idxs.iter().map(|&i| acct.stacks[i].msgs.len()).sum();
+        // "400 messages from DoorDash (12 in view)" — what moves, where it
+        // moves from, and how much of it the user has actually seen. Without
+        // the first number a stack showing 12 silently deletes 400; without
+        // the second the two numbers on screen contradict each other with no
+        // explanation (ADR 0002).
+        let mail = |idxs: &[usize], fan: &FanOut| -> String {
+            let n = fan.uids.len();
             let plural = if n == 1 { "" } else { "s" };
-            format!("{} message{plural} from {}", commas(n), whose(acct, idxs))
+            format!(
+                "{} message{plural} from {} ({} in view)",
+                commas(n),
+                whose(acct, idxs),
+                commas(fan.in_view)
+            )
         };
         match self {
-            PendingAction::Trash { stack_idxs } => format!("trash {}?", mail(stack_idxs)),
-            PendingAction::Archive { stack_idxs } => format!("archive {}?", mail(stack_idxs)),
+            PendingAction::Trash { stack_idxs, fan } => format!("trash {}?", mail(stack_idxs, fan)),
+            PendingAction::Archive { stack_idxs, fan } => {
+                format!("archive {}?", mail(stack_idxs, fan))
+            }
             PendingAction::Unsubscribe { stack_idxs } => {
                 // unsubscribing is per sender, not per message, so this one
                 // counts senders rather than the mail behind them
@@ -111,8 +167,8 @@ impl PendingAction {
                     format!("unsubscribe from {who}?")
                 }
             }
-            PendingAction::TrashAfterUnsub { stack_idxs } => {
-                format!("unsubscribed — also trash {}?", mail(stack_idxs))
+            PendingAction::TrashAfterUnsub { stack_idxs, fan } => {
+                format!("unsubscribed — also trash {}?", mail(stack_idxs, fan))
             }
         }
     }
@@ -155,6 +211,19 @@ pub enum TaskDone {
         stack_idxs: Vec<usize>,
         n_msgs: usize,
         label: String,
+        /// senders the fan-out could not enumerate, carried through so the
+        /// outcome can say the action reached only their mail in view
+        refused: Vec<String>,
+        result: Result<()>,
+    },
+    /// a fan-out finished; its count is what the confirm prompt states
+    Fanned {
+        /// None when a timeout left the session unusable
+        client: Option<Box<ImapClient>>,
+        what: FanFor,
+        stack_idxs: Vec<usize>,
+        fan: FanOut,
+        /// the fan-out gave up entirely — a refusal per sender is inside `fan`
         result: Result<()>,
     },
     Unsub {
@@ -197,11 +266,6 @@ pub struct AccountView {
     pub back: usize,
     /// the window has reached the oldest message in the mailbox
     pub reached_end: bool,
-    /// senders whose fan-out the server refused: their stacks hold only the
-    /// discovery sample, so their counts under-report and are marked `~`.
-    /// Nothing fills this any more — #30 makes partial an action-time error
-    /// and deletes it.
-    pub partial_senders: HashSet<String>,
     /// stack keys marked for bulk actions
     pub marked: HashSet<String>,
     /// stacks rendered on screen under the *current* grouping, keyed by stack
@@ -233,7 +297,6 @@ impl AccountView {
             total: 0,
             back: 0,
             reached_end: false,
-            partial_senders: HashSet::new(),
             marked: HashSet::new(),
             seen: HashMap::new(),
             acted: HashSet::new(),
@@ -286,15 +349,6 @@ impl AccountView {
         if self.selected >= self.stacks.len() {
             self.selected = self.stacks.len().saturating_sub(1);
         }
-    }
-
-    /// this stack's messages are only the discovery sample — the server
-    /// refused to enumerate the sender
-    pub fn is_partial(&self, stack: &Stack) -> bool {
-        !self.partial_senders.is_empty()
-            && self
-                .partial_senders
-                .contains(&stack.latest().sender_email.to_lowercase())
     }
 }
 
@@ -561,7 +615,6 @@ impl App {
             acct.total = 0;
             acct.back = 0;
             acct.reached_end = false;
-            acct.partial_senders.clear();
             acct.marked.clear();
             acct.selected = 0;
             acct.loaded = false;
@@ -794,26 +847,17 @@ impl App {
                 self.mode = Mode::Filter;
                 self.filter.clear();
             }
-            (KeyCode::Char('d'), _) => {
-                let targets = self.target_stacks();
-                if !targets.is_empty() {
-                    self.mode = Mode::Confirm(PendingAction::Trash {
-                        stack_idxs: targets,
-                    });
-                }
-            }
-            (KeyCode::Char('e'), _) => {
-                let targets = self.target_stacks();
-                if !targets.is_empty() {
-                    self.mode = Mode::Confirm(PendingAction::Archive {
-                        stack_idxs: targets,
-                    });
-                }
-            }
+            (KeyCode::Char('d'), _) => self.ask_before(FanFor::Trash),
+            (KeyCode::Char('e'), _) => self.ask_before(FanFor::Archive),
             (KeyCode::Char('r'), _) => {
                 let targets = self.target_stacks();
                 if !targets.is_empty() {
-                    self.spawn_imap(ImapKind::Read, targets);
+                    // marking read asks nothing and moves nothing out of the
+                    // mailbox, so it has no count to state and stays on the
+                    // mail the window is showing
+                    let uids = self.window_uids(&targets);
+                    let label = self.action_label(&targets);
+                    self.spawn_imap(ImapKind::Read, targets, uids, label, Vec::new());
                 }
             }
             (KeyCode::Char('u'), _) => {
@@ -883,17 +927,115 @@ impl App {
     /// dispatch a confirmed action to a background task so the event loop
     /// keeps drawing while the network work runs
     fn run_action(&mut self, action: PendingAction) {
+        // the fan-out already ran, ahead of the prompt: `y` acts on the set the
+        // user was given a number for, and no second SEARCH happens (ADR 0002)
         match action {
-            PendingAction::Trash { stack_idxs } | PendingAction::TrashAfterUnsub { stack_idxs } => {
-                self.spawn_imap(ImapKind::Trash, stack_idxs)
+            PendingAction::Trash { stack_idxs, fan }
+            | PendingAction::TrashAfterUnsub { stack_idxs, fan } => {
+                self.spawn_fanned(ImapKind::Trash, stack_idxs, fan)
             }
-            PendingAction::Archive { stack_idxs } => self.spawn_imap(ImapKind::Archive, stack_idxs),
+            PendingAction::Archive { stack_idxs, fan } => {
+                self.spawn_fanned(ImapKind::Archive, stack_idxs, fan)
+            }
             PendingAction::Unsubscribe { stack_idxs } => self.spawn_unsub(stack_idxs),
         }
     }
 
-    fn spawn_imap(&mut self, kind: ImapKind, stack_idxs: Vec<usize>) {
-        let (uids, label) = self.collect(&stack_idxs);
+    fn spawn_fanned(&mut self, kind: ImapKind, stack_idxs: Vec<usize>, fan: FanOut) {
+        let label = self.action_label(&stack_idxs);
+        self.spawn_imap(kind, stack_idxs, fan.uids, label, fan.refused);
+    }
+
+    /// `d`/`e`: find every message these senders still have, then ask. The
+    /// prompt states a mailbox-wide number, so the SEARCH behind it has to run
+    /// first — it is the round trip the action needs anyway, moved ahead of the
+    /// question (ADR 0002).
+    fn ask_before(&mut self, what: FanFor) {
+        let targets = self.target_stacks();
+        if !targets.is_empty() {
+            self.spawn_fan_out(what, targets);
+        }
+    }
+
+    fn spawn_fan_out(&mut self, what: FanFor, stack_idxs: Vec<usize>) {
+        // resolved before the client is taken, and before the task starts: the
+        // stacks stay untouched while it runs, because mutating keys are
+        // blocked when busy
+        let acct = self.account();
+        let senders: Vec<(String, Vec<u32>)> = stack_idxs
+            .iter()
+            .map(|&i| {
+                let s = &acct.stacks[i];
+                (s.latest().sender_email.clone(), s.uids())
+            })
+            .collect();
+        let Some(mut client) = self.account_mut().client.take() else {
+            self.status = "not connected — press R to reconnect".into();
+            return;
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.task_rx = Some(rx);
+        self.busy = true;
+        self.status = match &senders[..] {
+            [(addr, _)] => format!("searching for every message from {addr}…"),
+            many => format!("searching for every message from {} senders…", many.len()),
+        };
+        tokio::spawn(async move {
+            let mut fan = FanOut::default();
+            // the window's own mail is in the set whatever the search says, so
+            // an action can never reach less than what the user is looking at
+            let mut uids: HashSet<u32> = HashSet::new();
+            let mut in_view: HashSet<u32> = HashSet::new();
+            let mut result = Ok(());
+            let total = senders.len();
+            for (done, (addr, window_uids)) in senders.into_iter().enumerate() {
+                if total > 1 {
+                    // one SEARCH per sender, so a bulk action's wait grows with
+                    // the marks — the row says which one it is on
+                    let _ = tx.send(TaskMsg::Status(format!(
+                        "searching {}/{total}: {addr}…",
+                        done + 1
+                    )));
+                }
+                in_view.extend(window_uids.iter().copied());
+                uids.extend(window_uids);
+                match imap_client::fan_out(&mut client, &addr).await {
+                    Ok(found) => uids.extend(found),
+                    // the session state is unknown after a timeout, so there is
+                    // nothing left to search with — the rest of the senders
+                    // would only produce more of the same error
+                    Err(e) if imap_client::is_timeout(&e) => {
+                        result = Err(e);
+                        break;
+                    }
+                    Err(e) => {
+                        crate::debuglog::write(format!("imap fan-out refused {addr}: {e:#}"));
+                        fan.refused.push(addr);
+                    }
+                }
+            }
+            fan.uids = uids.into_iter().collect();
+            fan.in_view = in_view.len();
+            let dead = result.as_ref().err().is_some_and(imap_client::is_timeout);
+            let client = (!dead).then(|| Box::new(client));
+            let _ = tx.send(TaskMsg::Done(TaskDone::Fanned {
+                client,
+                what,
+                stack_idxs,
+                fan,
+                result,
+            }));
+        });
+    }
+
+    fn spawn_imap(
+        &mut self,
+        kind: ImapKind,
+        stack_idxs: Vec<usize>,
+        uids: Vec<u32>,
+        label: String,
+        refused: Vec<String>,
+    ) {
         let acct = self.account_mut();
         let Some(mut client) = acct.client.take() else {
             self.status = "not connected — press R to reconnect".into();
@@ -920,6 +1062,7 @@ impl App {
                 stack_idxs,
                 n_msgs: uids.len(),
                 label,
+                refused,
                 result,
             }));
         });
@@ -998,30 +1141,65 @@ impl App {
         // whatever raised it is over; a failed sweep puts its own back up below
         self.alert = None;
         match done {
+            TaskDone::Fanned {
+                client,
+                what,
+                stack_idxs,
+                fan,
+                result,
+            } => {
+                self.account_mut().client = client.map(|c| *c);
+                match result {
+                    // nothing was asked, so nothing is confirmed: the search
+                    // that would have produced the number never came back
+                    Err(e) => self.status = format!("error: {e:#}"),
+                    Ok(()) => {
+                        // said now rather than after `y`, because it changes
+                        // what answering `y` costs — and the status row is
+                        // still on screen behind the prompt
+                        self.status = match &fan.refused[..] {
+                            [] => self.account_summary(self.active),
+                            refused => format!(
+                                "search refused for {} — only their mail in view can be reached",
+                                refused.join(", ")
+                            ),
+                        };
+                        self.mode = Mode::Confirm(match what {
+                            FanFor::Trash => PendingAction::Trash { stack_idxs, fan },
+                            FanFor::Archive => PendingAction::Archive { stack_idxs, fan },
+                            FanFor::TrashAfterUnsub => {
+                                PendingAction::TrashAfterUnsub { stack_idxs, fan }
+                            }
+                        });
+                    }
+                }
+            }
             TaskDone::Imap {
                 client,
                 kind,
                 stack_idxs,
                 n_msgs,
                 label,
+                refused,
                 result,
             } => match result {
                 Ok(()) => {
                     self.account_mut().client = Some(*client);
+                    let short = only_in_view(&refused);
                     match kind {
                         ImapKind::Trash => {
                             self.log_action(Action::Trash, &stack_idxs);
-                            self.prune_window(&stack_idxs);
+                            self.prune_window(&stack_idxs, n_msgs);
                             self.remove_stacks(stack_idxs);
                             self.stats.trashed += n_msgs;
-                            self.status = format!("trashed {n_msgs} messages from {label}");
+                            self.status = format!("trashed {n_msgs} messages from {label}{short}");
                         }
                         ImapKind::Archive => {
                             self.log_action(Action::Archive, &stack_idxs);
-                            self.prune_window(&stack_idxs);
+                            self.prune_window(&stack_idxs, n_msgs);
                             self.remove_stacks(stack_idxs);
                             self.stats.archived += n_msgs;
-                            self.status = format!("archived {n_msgs} messages from {label}");
+                            self.status = format!("archived {n_msgs} messages from {label}{short}");
                         }
                         ImapKind::Read => {
                             // snapshot before mutating flags so the log shows
@@ -1065,8 +1243,9 @@ impl App {
                 self.stats.unsubscribed += ok;
                 self.log_action(Action::Unsub, &ok_idxs);
                 if ok > 0 {
-                    // chain into "also trash?" prompt
-                    self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
+                    // chain into "also trash?" — which states a mailbox-wide
+                    // count like any other trash, so it fans out first
+                    self.spawn_fan_out(FanFor::TrashAfterUnsub, stack_idxs);
                 }
             }
             TaskDone::Swept {
@@ -1157,34 +1336,38 @@ impl App {
         self.spinner = self.spinner.wrapping_add(1);
     }
 
-    /// merged uids across stacks + a human label for the status line
-    fn collect(&self, stack_idxs: &[usize]) -> (Vec<u32>, String) {
+    /// the mail these stacks hold inside the window — what the user is looking
+    /// at. An action's own set comes from the fan-out instead.
+    fn window_uids(&self, stack_idxs: &[usize]) -> Vec<u32> {
         let acct = self.account();
-        let uids: Vec<u32> = stack_idxs
+        stack_idxs
             .iter()
             .flat_map(|&i| acct.stacks[i].uids())
-            .collect();
-        let label = if let [i] = stack_idxs[..] {
-            acct.stacks[i].display_name.clone()
-        } else {
-            format!("{} stacks", stack_idxs.len())
-        };
-        (uids, label)
+            .collect()
     }
 
-    /// Account for messages that just left INBOX. Every one of them was inside
-    /// the window — a stack is made of swept mail — so both the mailbox total
-    /// and the window's reach shrink by the same count. Without the second,
-    /// the next `m` would start that many messages too deep and leave a hole
-    /// where the trashed mail used to sit.
-    fn prune_window(&mut self, stack_idxs: &[usize]) {
+    /// who an action is about, for the status line
+    fn action_label(&self, stack_idxs: &[usize]) -> String {
+        match stack_idxs {
+            [i] => self.account().stacks[*i].display_name.clone(),
+            many => format!("{} stacks", many.len()),
+        }
+    }
+
+    /// Account for the `gone` messages that just left INBOX. All of them are
+    /// out of the mailbox, so the total falls by all of them — but only the
+    /// ones the window was showing move its reach, because expunging mail
+    /// older than the window does not shift what sits above it. Without the
+    /// second, the next `m` would start that many messages too deep and leave
+    /// a hole where the trashed mail used to sit.
+    fn prune_window(&mut self, stack_idxs: &[usize], gone: usize) {
         let acct = self.account_mut();
-        let gone: HashSet<u32> = stack_idxs
+        let in_window: HashSet<u32> = stack_idxs
             .iter()
             .flat_map(|&i| acct.stacks[i].uids())
             .collect();
-        acct.total = acct.total.saturating_sub(gone.len());
-        acct.back = acct.back.saturating_sub(gone.len());
+        acct.total = acct.total.saturating_sub(gone);
+        acct.back = acct.back.saturating_sub(in_window.len());
     }
 
     fn remove_stacks(&mut self, mut stack_idxs: Vec<usize>) {
@@ -1244,6 +1427,15 @@ mod tests {
         app.accounts[0].reached_end = true;
         app.accounts[0].loaded = true;
         app
+    }
+
+    /// a fan-out that found `uids`, `in_view` of them inside the window
+    fn fanned(uids: &[u32], in_view: usize) -> FanOut {
+        FanOut {
+            uids: uids.to_vec(),
+            in_view,
+            refused: Vec::new(),
+        }
     }
 
     /// a window that read `swept` of `bound` and came back with `msgs`
@@ -1359,10 +1551,12 @@ mod tests {
         });
         assert!(!app.busy);
         assert_eq!(app.stats.unsubscribed, 1);
-        assert!(matches!(
-            app.mode,
-            Mode::Confirm(PendingAction::TrashAfterUnsub { .. })
-        ));
+        // the "also trash?" offer states a mailbox-wide count like any other
+        // trash, so it waits on a fan-out rather than opening blind. There is
+        // no session in a unit test, so the search cannot be spawned — what is
+        // asserted is that nothing was confirmed without a number behind it.
+        assert!(!matches!(app.mode, Mode::Confirm(_)));
+        assert!(app.status.contains("not connected"), "{}", app.status);
         let raw = std::fs::read_to_string(&path).unwrap();
         let recs: Vec<serde_json::Value> = raw
             .lines()
@@ -1493,24 +1687,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// a stack's count under-reports only when the server refused a fan-out;
-    /// nothing in the sweep path sets it, and #30 removes the state entirely
-    #[test]
-    fn a_partial_sender_marks_only_its_own_stack() {
-        let path = temp_log("partial");
-        let mut app = test_app(ActionLog::at(path.clone()));
-        app.accounts[0].partial_senders.insert("b@x.com".into());
-
-        let acct = &app.accounts[0];
-        let b = &acct.stacks[stack_idx(&app, "b@x.com")];
-        assert!(acct.is_partial(b));
-        assert!(
-            !acct.is_partial(&acct.stacks[stack_idx(&app, "a@x.com")]),
-            "the others are unaffected"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// Spec: a refused chunk keeps the chunks that landed and reports a short
     /// window. `back` stops where the sweep did, so `m` retries the remainder
     /// of that window before advancing (ADR 0003).
@@ -1632,18 +1808,22 @@ mod tests {
     /// Trashed mail leaves the mailbox, so the window's own reach shrinks with
     /// it. Without that, the next `m` would start that many messages too deep
     /// and skip the mail that slid up into the hole.
+    ///
+    /// The two numbers move by different amounts: an action reaches the whole
+    /// fan-out, but only the part inside the window sits above the window's
+    /// oldest edge, and only that part shifts it.
     #[test]
-    fn trashing_pulls_the_window_back_by_what_left_the_mailbox() {
+    fn trashing_pulls_the_window_back_by_what_left_it_and_the_total_by_all_of_it() {
         let path = temp_log("prune");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.accounts[0].total = 137_482;
         app.accounts[0].back = 5_000;
-        // "a@x.com" holds two of the swept messages
+        // "a@x.com" holds two of the swept messages; the fan-out found 400
         let a = stack_idx(&app, "a@x.com");
-        app.prune_window(&[a]);
+        app.prune_window(&[a], 400);
 
-        assert_eq!(app.accounts[0].total, 137_480);
-        assert_eq!(app.accounts[0].back, 4_998);
+        assert_eq!(app.accounts[0].total, 137_082, "all 400 left the mailbox");
+        assert_eq!(app.accounts[0].back, 4_998, "two of them were in the window");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2149,6 +2329,167 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// a fan-out landing for `what`, with `uids` found and `in_view` on screen
+    fn fan_landed(app: &mut App, what: FanFor, stack_idxs: Vec<usize>, fan: FanOut) {
+        app.on_task_done(TaskDone::Fanned {
+            client: None,
+            what,
+            stack_idxs,
+            fan,
+            result: Ok(()),
+        });
+    }
+
+    /// ADR 0002: counts on screen are window counts, the number the user
+    /// confirms is mailbox-wide, and the prompt is the only place the two are
+    /// reconciled. Without both, a stack showing 12 silently deletes 400.
+    #[test]
+    fn the_confirm_states_the_mailbox_wide_count_and_the_one_in_view() {
+        let path = temp_log("fan-prompt");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+
+        fan_landed(
+            &mut app,
+            FanFor::Trash,
+            vec![a],
+            fanned(&(1..=400).collect::<Vec<u32>>(), 12),
+        );
+
+        let Mode::Confirm(action) = &app.mode else {
+            panic!("a landed fan-out opens the confirm it was run for");
+        };
+        assert_eq!(
+            action.prompt(app.account()),
+            "trash 400 messages from a@x.com (12 in view)?"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The prompt cannot be drawn before the number in it exists, so `d` runs
+    /// the search and only then asks. Pressing it opens nothing by itself.
+    #[test]
+    fn d_asks_nothing_until_the_search_behind_the_number_has_run() {
+        let path = temp_log("fan-d");
+        let mut app = test_app(ActionLog::at(path.clone()));
+
+        press(&mut app, KeyCode::Char('d'));
+
+        assert!(
+            !matches!(app.mode, Mode::Confirm(_)),
+            "no confirm without a count behind it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A timeout leaves the session unknown, so the number the prompt would
+    /// have stated never arrived — there is nothing to confirm.
+    #[test]
+    fn a_fan_out_that_never_came_back_asks_nothing() {
+        let path = temp_log("fan-timeout");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.busy = true;
+
+        app.on_task_done(TaskDone::Fanned {
+            client: None,
+            what: FanFor::Trash,
+            stack_idxs: vec![0],
+            fan: FanOut::default(),
+            result: Err(anyhow::anyhow!("imap search timed out after 60s")),
+        });
+
+        assert!(!app.busy);
+        assert!(matches!(app.mode, Mode::Normal), "nothing was asked");
+        assert!(app.status.starts_with("error:"), "{}", app.status);
+        assert!(app.accounts[0].client.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The fan-out is the round trip the action needs anyway, moved ahead of
+    /// the question — so answering `y` spends no second search, and answering
+    /// `n` has already spent the only one.
+    #[test]
+    fn declining_costs_the_one_search_and_nothing_else() {
+        let path = temp_log("fan-decline");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        let before = app.accounts[0].stacks.len();
+
+        fan_landed(&mut app, FanFor::Trash, vec![a], fanned(&[1, 2, 7], 2));
+        send(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.task_rx.is_none(), "nothing was spawned");
+        assert_eq!(app.accounts[0].stacks.len(), before);
+        assert_eq!(app.status, "cancelled");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Partial is an action-time error now: the SEARCH was refused, so the
+    /// action reaches only that sender's mail in view. It is never a state the
+    /// stack sits in, and the row it came from carries no mark of it.
+    #[test]
+    fn a_refused_search_is_reported_against_the_action_not_the_stack() {
+        let path = temp_log("fan-refused");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        let fan = FanOut {
+            uids: vec![1, 2],
+            in_view: 2,
+            refused: vec!["a@x.com".into()],
+        };
+
+        fan_landed(&mut app, FanFor::Trash, vec![a], fan);
+
+        assert!(
+            app.status.contains("search refused for a@x.com"),
+            "the refusal is told before `y` is pressed, because it changes \
+             what `y` costs: {}",
+            app.status
+        );
+        assert!(
+            matches!(app.mode, Mode::Confirm(_)),
+            "and the action still runs, on the mail it can reach"
+        );
+        // and the outcome repeats it, because the status row will have moved
+        // on by the time the action lands
+        assert!(only_in_view(&["a@x.com".into()]).contains("a@x.com"));
+        assert!(only_in_view(&["a@x.com".into()]).contains("only its mail in view"));
+        assert_eq!(only_in_view(&[]), "", "a clean action says nothing extra");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sender whose action partially failed reappears in a later window as
+    /// an ordinary stack — the error already told the user at the time, and
+    /// there is no cross-window memory of it to render.
+    #[test]
+    fn a_refusal_leaves_no_trace_on_the_stacks_it_touched() {
+        let path = temp_log("fan-no-memory");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        let fan = FanOut {
+            uids: vec![1, 2],
+            in_view: 2,
+            refused: vec!["a@x.com".into()],
+        };
+        fan_landed(&mut app, FanFor::Trash, vec![a], fan);
+
+        // a later window folds a@ back in like any other sender
+        app.mode = Mode::Normal;
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(5, "a@x.com", "three")], 9, 1, 1),
+            result: Ok(()),
+        });
+
+        let a = stack_idx(&app, "a@x.com");
+        assert_eq!(app.accounts[0].stacks[a].msgs.len(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// the hint line answers `[y/n]`, so the prompt saying it too is the UI
     /// stating the same thing twice in one box
     #[test]
@@ -2157,6 +2498,7 @@ mod tests {
         let app = test_app(ActionLog::at(path.clone()));
         let prompt = PendingAction::Trash {
             stack_idxs: vec![0],
+            fan: fanned(&[1, 2], 2),
         }
         .prompt(app.account());
         assert!(!prompt.contains("[y/n]"), "{prompt:?}");
