@@ -3,9 +3,11 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action_log::{Action, ActionLog, StackSnapshot};
 use crate::config::AccountConfig;
-use crate::imap_client::{self, ImapClient, SenderBatch};
-use crate::stacks::{GroupBy, SortBy, Stack, build_stacks, sort_stacks};
+use crate::imap_client::{self, ImapClient};
+use crate::stacks::{GroupBy, MsgMeta, SortBy, Stack, build_stacks, sort_stacks};
 use crate::unsubscribe;
+
+use super::view::commas;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
@@ -73,22 +75,9 @@ impl PendingAction {
 
 /// messages sent from a spawned action task back to the event loop
 pub enum TaskMsg {
-    /// progress line for the status bar
+    /// progress line for the status bar. A sweep's chunks report here and
+    /// nowhere else: nothing renders until the window completes (ADR 0003).
     Status(String),
-    /// the fresh uid list from a reset load. Sent ahead of the batch so the
-    /// pane title can show the true mailbox total while stacks are still
-    /// streaming in.
-    Uids {
-        acct_idx: usize,
-        uids: Vec<u32>,
-    },
-    /// one sender resolved. Fan-out is serial on the single session — two
-    /// round trips per sender — so waiting for the whole batch would be
-    /// seconds of blank screen; streaming puts the first stacks up at ~200ms.
-    Sender {
-        acct_idx: usize,
-        batch: Box<SenderBatch>,
-    },
     Done(TaskDone),
 }
 
@@ -99,12 +88,12 @@ pub enum ImapKind {
     Read,
 }
 
-/// what a load batch does to what is already on screen
+/// what a sweep does to what is already on screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Load {
-    /// `R` and first load: re-take the uid list and clear everything loaded
+    /// `R` and first load: discard the window and sweep it again from the top
     Reset,
-    /// `m`: continue from the cursor and append
+    /// `m`: widen the window by another sweep behind the one already read
     More,
 }
 
@@ -125,9 +114,9 @@ pub enum TaskDone {
         failed: usize,
         last: String,
     },
-    /// a load batch finished for `acct_idx`; its stacks already arrived as
-    /// `TaskMsg::Sender`s
-    Batch {
+    /// a sweep finished for `acct_idx`, carrying the whole window it read —
+    /// the list is built once, here, and never chunk by chunk
+    Swept {
         acct_idx: usize,
         /// None when the session is unusable (connect failed, or a timeout
         /// left the session in an unknown state)
@@ -135,10 +124,10 @@ pub enum TaskDone {
         /// the keychain lookup's result, cached so later loads skip it
         password: Option<String>,
         kind: Load,
-        /// how far discovery got. Reported alongside the outcome rather than
-        /// inside it: a failure does not un-scan the UIDs already read, and
-        /// dropping the cursor would make the next `m` re-read them.
-        cursor: usize,
+        /// what the sweep read. Reported alongside the outcome rather than
+        /// inside it: a failure does not un-read the chunks that landed, and
+        /// dropping them would make the next `m` re-read them.
+        sweep: Box<imap_client::Sweep>,
         result: Result<()>,
     },
 }
@@ -150,17 +139,19 @@ pub struct AccountView {
     pub stacks: Vec<Stack>,
     pub selected: usize,
     pub loaded: bool,
-    /// every uid in INBOX, newest first, taken once per reset. UIDs are
-    /// immutable, so the cursor below survives trashing — sequence numbers
-    /// would be renumbered by every `UID MOVE`.
-    pub uids: Vec<u32>,
-    /// how far discovery has walked `uids`
-    pub cursor: usize,
-    /// lowercased addresses already fanned out, so `m` yields a batch of
-    /// senders that are new rather than sightings of the ones on screen
-    pub known_senders: HashSet<String>,
+    /// every message in INBOX, from the last sweep's `EXISTS`
+    pub total: usize,
+    /// How far back from the newest message the window reaches — the count the
+    /// next sweep starts behind. Not a UID: sequence numbers are renumbered by
+    /// every arrival and every `UID MOVE`, so the window is a distance from the
+    /// top and is re-anchored off a fresh `EXISTS` each sweep (ADR 0003).
+    pub back: usize,
+    /// the window has reached the oldest message in the mailbox
+    pub reached_end: bool,
     /// senders whose fan-out the server refused: their stacks hold only the
-    /// discovery sample, so their counts under-report and are marked `~`
+    /// discovery sample, so their counts under-report and are marked `~`.
+    /// Nothing fills this any more — #30 makes partial an action-time error
+    /// and deletes it.
     pub partial_senders: HashSet<String>,
     /// stack keys marked for bulk actions
     pub marked: HashSet<String>,
@@ -190,9 +181,9 @@ impl AccountView {
             stacks: Vec::new(),
             selected: 0,
             loaded: false,
-            uids: Vec::new(),
-            cursor: 0,
-            known_senders: HashSet::new(),
+            total: 0,
+            back: 0,
+            reached_end: false,
             partial_senders: HashSet::new(),
             marked: HashSet::new(),
             seen: HashMap::new(),
@@ -208,12 +199,33 @@ impl AccountView {
     /// every message in INBOX. Falls as mail is trashed, which is the number
     /// this tool exists to move.
     pub fn inbox_total(&self) -> usize {
-        self.uids.len()
+        self.total
     }
 
-    /// no more senders left to discover
+    /// the window reaches the oldest message — there is nothing left to sweep
     pub fn exhausted(&self) -> bool {
-        self.cursor >= self.uids.len()
+        self.reached_end
+    }
+
+    /// Fold a completed window's messages in and rebuild every stack, so the
+    /// list is grouped and sorted once rather than merged chunk by chunk
+    /// (ADR 0003). Windows can overlap when mail arrived between two sweeps,
+    /// so a message already held wins over the repeat.
+    fn absorb(&mut self, msgs: Vec<MsgMeta>, group_by: GroupBy, sort_by: SortBy) {
+        let mut all: Vec<MsgMeta> = self.stacks.drain(..).flat_map(|s| s.msgs).collect();
+        all.extend(msgs);
+        let mut seen = HashSet::new();
+        all.retain(|m| seen.insert(m.uid));
+        self.stacks = build_stacks(all, group_by, sort_by);
+        self.clamp_selection();
+    }
+
+    /// keep the selection on a row that exists. #27 replaces this with
+    /// following the selected stack by key across the completion sort.
+    fn clamp_selection(&mut self) {
+        if self.selected >= self.stacks.len() {
+            self.selected = self.stacks.len().saturating_sub(1);
+        }
     }
 
     /// this stack's messages are only the discovery sample — the server
@@ -328,13 +340,20 @@ impl App {
         }
     }
 
-    /// called by the view with the stack rows actually on screen this frame;
-    /// features are frozen at first sighting
+    /// Called by the view with the stack rows actually on screen this frame.
+    /// Features are frozen at first sighting, except when a widened window has
+    /// grown the stack: `m` folds new messages into stacks already on screen,
+    /// and a "keep" that reported the count from before the widening would
+    /// under-report the mail the user actually decided to keep.
     pub fn record_seen(&mut self, stack_idxs: &[usize]) {
         let acct = self.account_mut();
         for &i in stack_idxs {
             let stack = &acct.stacks[i];
-            if !acct.seen.contains_key(&stack.key) {
+            let grown = acct
+                .seen
+                .get(&stack.key)
+                .is_some_and(|seen| seen.uids.len() < stack.msgs.len());
+            if grown || !acct.seen.contains_key(&stack.key) {
                 let seen = SeenStack {
                     snap: StackSnapshot::of(stack),
                     uids: stack.uids(),
@@ -409,23 +428,23 @@ impl App {
         )
     }
 
-    /// `m`: one more batch of senders, appended. The mailbox is never loaded
-    /// whole — loading is explicit, and the pane refills only on this key.
-    /// The uid list is untouched, so this is bounded work however big it is.
+    /// `m`: widen the window by one more sweep, behind the one already read.
+    /// The mailbox is never loaded whole — every sweep is the same bounded
+    /// work however big it is.
     fn load_more(&mut self) {
         let acct = self.account();
         if acct.loaded && acct.exhausted() {
-            self.status = "no more senders — R to refresh".into();
+            self.status = "no more messages — R to refresh".into();
             return;
         }
         self.spawn_batch(Load::More);
     }
 
-    /// connect (if needed) and load one batch of senders in a background task,
-    /// so the event loop keeps drawing while the network work runs
+    /// connect (if needed) and sweep one window in a background task, so the
+    /// event loop keeps drawing while the network work runs
     pub fn spawn_batch(&mut self, kind: Load) {
         let acct_idx = self.active;
-        // without a uid list there is no cursor to continue from
+        // nothing swept yet means there is no window to widen
         let reset = kind == Load::Reset || !self.accounts[acct_idx].loaded;
         let kind = if reset { Load::Reset } else { Load::More };
         let acct = &mut self.accounts[acct_idx];
@@ -436,9 +455,9 @@ impl App {
         let existing = acct.client.take();
         if reset {
             acct.stacks.clear();
-            acct.uids.clear();
-            acct.cursor = 0;
-            acct.known_senders.clear();
+            acct.total = 0;
+            acct.back = 0;
+            acct.reached_end = false;
             acct.partial_senders.clear();
             acct.marked.clear();
             acct.selected = 0;
@@ -446,15 +465,13 @@ impl App {
             // `seen` is kept: a reset keeps the current grouping, so its
             // snapshots still describe the same stacks
         }
-        let uids = acct.uids.clone();
-        let cursor = acct.cursor;
-        let known = acct.known_senders.clone();
+        let back = acct.back;
         let (tx, rx) = mpsc::unbounded_channel();
         self.task_rx = Some(rx);
         self.busy = true;
         self.loading = true;
         self.status = if existing.is_some() {
-            format!("finding senders for {}…", cfg.email)
+            format!("sweeping {}…", cfg.email)
         } else {
             format!("connecting to {}…", cfg.email)
         };
@@ -482,12 +499,12 @@ impl App {
                                     p
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
+                                    let _ = tx.send(TaskMsg::Done(TaskDone::Swept {
                                         acct_idx,
                                         client: None,
                                         password: None,
                                         kind,
-                                        cursor,
+                                        sweep: Box::default(),
                                         result: Err(e),
                                     }));
                                     return;
@@ -498,12 +515,12 @@ impl App {
                     match ImapClient::connect(&cfg, &password).await {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
+                            let _ = tx.send(TaskMsg::Done(TaskDone::Swept {
                                 acct_idx,
                                 client: None,
                                 password: resolved,
                                 kind,
-                                cursor,
+                                sweep: Box::default(),
                                 result: Err(e),
                             }));
                             return;
@@ -511,52 +528,28 @@ impl App {
                     }
                 }
             };
-            let mut uids = uids;
-            if reset {
-                let _ = tx.send(TaskMsg::Status(format!("listing {}…", cfg.email)));
-                match client.uid_list().await {
-                    Ok(list) => {
-                        uids = list;
-                        let _ = tx.send(TaskMsg::Uids {
-                            acct_idx,
-                            uids: uids.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
-                            acct_idx,
-                            client: None,
-                            password: resolved,
-                            kind,
-                            cursor,
-                            result: Err(e),
-                        }));
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(TaskMsg::Status(format!(
-                "finding senders for {}…",
-                cfg.email
-            )));
-            let (cursor, result) =
-                imap_client::load_batch(&mut client, &uids, cursor, &known, |batch| {
-                    let _ = tx.send(TaskMsg::Sender {
-                        acct_idx,
-                        batch: Box::new(batch),
-                    });
-                })
-                .await;
+            let email = cfg.email.clone();
+            let (sweep, result) = imap_client::sweep(&mut client, back, |p| {
+                // the only feedback a sweep gives: the list itself does not
+                // move until the window is complete (ADR 0003)
+                let _ = tx.send(TaskMsg::Status(format!(
+                    "sweeping {email} — {} of {} · {} stacks",
+                    commas(p.swept),
+                    commas(p.bound),
+                    p.stacks
+                )));
+            })
+            .await;
             // after a timeout the session state is unknown, so the client goes;
             // a server refusal leaves the connection perfectly usable
             let dead = result.as_ref().err().is_some_and(imap_client::is_timeout);
             let client = (!dead).then(|| Box::new(client));
-            let _ = tx.send(TaskMsg::Done(TaskDone::Batch {
+            let _ = tx.send(TaskMsg::Done(TaskDone::Swept {
                 acct_idx,
                 client,
                 password: resolved,
                 kind,
-                cursor,
+                sweep: Box::new(sweep),
                 result,
             }));
         });
@@ -877,14 +870,14 @@ impl App {
                     match kind {
                         ImapKind::Trash => {
                             self.log_action(Action::Trash, &stack_idxs);
-                            self.prune_uids(&stack_idxs);
+                            self.prune_window(&stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.trashed += n_msgs;
                             self.status = format!("trashed {n_msgs} messages from {label}");
                         }
                         ImapKind::Archive => {
                             self.log_action(Action::Archive, &stack_idxs);
-                            self.prune_uids(&stack_idxs);
+                            self.prune_window(&stack_idxs);
                             self.remove_stacks(stack_idxs);
                             self.stats.archived += n_msgs;
                             self.status = format!("archived {n_msgs} messages from {label}");
@@ -935,66 +928,60 @@ impl App {
                     self.mode = Mode::Confirm(PendingAction::TrashAfterUnsub { stack_idxs });
                 }
             }
-            TaskDone::Batch {
+            TaskDone::Swept {
                 acct_idx,
                 client,
                 password,
                 kind,
-                cursor,
+                mut sweep,
                 result,
             } => {
-                let sort_by = self.sort_by;
+                let (group_by, sort_by) = (self.group_by, self.sort_by);
                 let acct = &mut self.accounts[acct_idx];
                 acct.client = client.map(|c| *c);
                 if password.is_some() {
                     acct.password = password;
                 }
-                // the cursor lands either way: a failure does not un-scan the
-                // UIDs discovery already read
-                acct.cursor = cursor;
+                // A sweep that never reached its `EXISTS` — a failed connect or
+                // keychain read — knows nothing about the mailbox, and must not
+                // overwrite what the last one learned with zeroes.
+                if sweep.anchored {
+                    // the window lands either way: a failure does not un-read
+                    // the chunks that arrived, and dropping them would make the
+                    // next `m` re-read them. A short window is one the sweep
+                    // stopped inside, so `back` moves by what was actually
+                    // swept, not by the bound.
+                    acct.total = sweep.total;
+                    acct.back += sweep.swept;
+                    acct.reached_end = sweep.reached_end;
+                    acct.loaded = true;
+                    if sweep.swept > 0 {
+                        acct.absorb(std::mem::take(&mut sweep.msgs), group_by, sort_by);
+                    }
+                    if kind == Load::Reset {
+                        acct.selected = 0;
+                    }
+                }
                 match result {
                     Ok(()) => {
-                        acct.loaded = true;
-                        if kind == Load::Reset {
-                            // the batch streamed in one sender at a time, so
-                            // until now the order is discovery order
-                            sort_stacks(&mut acct.stacks, sort_by);
-                            acct.selected = 0;
-                        }
                         self.status = self.account_summary(acct_idx);
                     }
-                    // already-streamed stacks stay on screen: a failure that
-                    // arrives halfway through is not a reason to throw away
-                    // the half that worked
+                    // the stacks that landed stay on screen: a failure halfway
+                    // through the window is not a reason to throw away the
+                    // half that worked. `back` stopped where the sweep did, so
+                    // `m` retries the remainder of this window before it
+                    // advances (ADR 0003).
+                    Err(e) if sweep.short() => {
+                        self.status = format!(
+                            "sweep stopped at {} of {} — press m to retry ({e:#})",
+                            commas(sweep.swept),
+                            commas(sweep.bound)
+                        )
+                    }
                     Err(e) => self.status = format!("error: {e:#}"),
                 }
             }
         }
-    }
-
-    /// the uid list for a reset load, which arrives before the stacks do
-    pub fn on_uids(&mut self, acct_idx: usize, uids: Vec<u32>) {
-        let acct = &mut self.accounts[acct_idx];
-        acct.uids = uids;
-        acct.cursor = 0;
-    }
-
-    /// one sender resolved mid-batch. It is new by construction — discovery
-    /// skips known senders — so its stacks cannot collide with any already on
-    /// screen and are simply appended.
-    pub fn on_sender(&mut self, acct_idx: usize, batch: SenderBatch) {
-        let (group_by, sort_by) = (self.group_by, self.sort_by);
-        let acct = &mut self.accounts[acct_idx];
-        acct.known_senders.insert(batch.addr.clone());
-        if batch.partial {
-            acct.partial_senders.insert(batch.addr);
-        }
-        if batch.msgs.is_empty() {
-            return;
-        }
-        acct.stacks
-            .append(&mut build_stacks(batch.msgs, group_by, sort_by));
-        acct.loaded = true;
     }
 
     /// advance the status-bar spinner one frame
@@ -1017,31 +1004,19 @@ impl App {
         (uids, label)
     }
 
-    /// Drop uids that left INBOX from the discovery list, so a later `m` does
-    /// not spend its scan budget reading a graveyard. The cursor is pulled back
-    /// by however many of them sat behind it, keeping it over the same message.
-    fn prune_uids(&mut self, stack_idxs: &[usize]) {
+    /// Account for messages that just left INBOX. Every one of them was inside
+    /// the window — a stack is made of swept mail — so both the mailbox total
+    /// and the window's reach shrink by the same count. Without the second,
+    /// the next `m` would start that many messages too deep and leave a hole
+    /// where the trashed mail used to sit.
+    fn prune_window(&mut self, stack_idxs: &[usize]) {
         let acct = self.account_mut();
         let gone: HashSet<u32> = stack_idxs
             .iter()
             .flat_map(|&i| acct.stacks[i].uids())
             .collect();
-        if gone.is_empty() {
-            return;
-        }
-        let cursor = acct.cursor;
-        let mut removed_before = 0;
-        let mut i = 0;
-        // retain visits in order, so `i` tracks the position in the old list
-        acct.uids.retain(|uid| {
-            let keep = !gone.contains(uid);
-            if !keep && i < cursor {
-                removed_before += 1;
-            }
-            i += 1;
-            keep
-        });
-        acct.cursor = cursor - removed_before;
+        acct.total = acct.total.saturating_sub(gone.len());
+        acct.back = acct.back.saturating_sub(gone.len());
     }
 
     fn remove_stacks(&mut self, mut stack_idxs: Vec<usize>) {
@@ -1052,15 +1027,14 @@ impl App {
             acct.stacks.remove(i);
         }
         acct.marked.clear();
-        if acct.selected >= acct.stacks.len() {
-            acct.selected = acct.stacks.len().saturating_sub(1);
-        }
+        acct.clamp_selection();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imap_client::Sweep;
     use crate::stacks::MsgMeta;
 
     fn msg(uid: u32, sender: &str, subject: &str) -> MsgMeta {
@@ -1097,18 +1071,23 @@ mod tests {
         let mut app = App::new(vec![cfg], log);
         app.group_by = GroupBy::Sender;
         app.accounts[0].stacks = build_stacks(test_msgs(), GroupBy::Sender, SortBy::Count);
-        app.accounts[0].uids = vec![4, 3, 2, 1];
-        app.accounts[0].cursor = 4;
+        app.accounts[0].total = 4;
+        app.accounts[0].back = 4;
+        app.accounts[0].reached_end = true;
         app.accounts[0].loaded = true;
         app
     }
 
-    fn sender(addr: &str, msgs: Vec<MsgMeta>) -> SenderBatch {
-        SenderBatch {
-            addr: addr.into(),
+    /// a window that read `swept` of `bound` and came back with `msgs`
+    fn window(msgs: Vec<MsgMeta>, total: usize, bound: usize, swept: usize) -> Box<Sweep> {
+        Box::new(Sweep {
             msgs,
-            partial: false,
-        }
+            total,
+            anchored: true,
+            bound,
+            swept,
+            reached_end: swept == total,
+        })
     }
 
     fn read_records(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -1226,46 +1205,55 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// ADR 0003: nothing renders until the window completes, and the list is
+    /// grouped and sorted once, from everything the sweep read.
     #[test]
-    fn a_reset_batch_streams_stacks_in_then_sorts_once_it_completes() {
-        let path = temp_log("load-ok");
+    fn a_completed_sweep_builds_the_whole_list_at_once() {
+        let path = temp_log("sweep-ok");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.accounts[0].stacks.clear();
         app.accounts[0].loaded = false;
+        app.accounts[0].total = 0;
+        app.accounts[0].back = 0;
+        app.accounts[0].reached_end = false;
         app.busy = true;
 
-        app.on_uids(0, vec![4, 3, 2, 1]);
-        assert_eq!(app.accounts[0].inbox_total(), 4);
-        // the smaller sender resolves first, so a sorted result proves the
-        // completion sort ran rather than discovery order surviving
-        app.on_sender(0, sender("b@x.com", vec![msg(3, "b@x.com", "one")]));
-        assert_eq!(app.accounts[0].stacks.len(), 1, "stacks appear mid-batch");
-        app.on_sender(
-            0,
-            sender(
-                "a@x.com",
-                vec![msg(1, "a@x.com", "one"), msg(2, "a@x.com", "two")],
-            ),
-        );
-        app.on_task_done(TaskDone::Batch {
+        // b@ has one message and a@ two, handed over in that order: a sorted
+        // list proves the completion sort ran rather than arrival order
+        // surviving
+        app.on_task_done(TaskDone::Swept {
             acct_idx: 0,
             client: None,
             password: None,
             kind: Load::Reset,
-            cursor: 4,
+            sweep: window(
+                vec![
+                    msg(3, "b@x.com", "one"),
+                    msg(1, "a@x.com", "one"),
+                    msg(2, "a@x.com", "two"),
+                ],
+                4,
+                4,
+                4,
+            ),
             result: Ok(()),
         });
 
         assert!(!app.busy);
         assert!(app.task_rx.is_none());
         assert!(app.accounts[0].loaded);
-        assert_eq!(app.accounts[0].cursor, 4);
+        assert_eq!(app.accounts[0].inbox_total(), 4, "the total is EXISTS");
+        assert_eq!(app.accounts[0].back, 4, "the window reaches what it swept");
+        assert!(
+            app.accounts[0].exhausted(),
+            "the sweep hit the oldest message"
+        );
         let keys: Vec<&str> = app.accounts[0]
             .stacks
             .iter()
             .map(|s| s.key.as_str())
             .collect();
-        assert_eq!(keys, ["a@x.com", "b@x.com"], "sorted by count on reset");
+        assert_eq!(keys, ["a@x.com", "b@x.com"], "sorted by count");
         assert!(
             app.status.contains("3 of 4 messages"),
             "status: {}",
@@ -1274,113 +1262,230 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `m` means one thing: a batch more senders, on the end. It must not reorder
-    /// what the user is already looking at.
+    /// `m` widens the window, and the list is rebuilt from every window the
+    /// session has read — one grouping pass over the whole store, not a merge
     #[test]
-    fn a_continuation_batch_appends_without_reordering() {
-        let path = temp_log("load-more");
+    fn m_folds_the_new_window_into_the_stacks_already_on_screen() {
+        let path = temp_log("sweep-more");
         let mut app = test_app(ActionLog::at(path.clone()));
-        let before: Vec<String> = app.accounts[0]
-            .stacks
-            .iter()
-            .map(|s| s.key.clone())
-            .collect();
 
-        // one message, so sorting by count would put it first
-        app.on_sender(0, sender("c@x.com", vec![msg(9, "c@x.com", "hi")]));
-        app.on_task_done(TaskDone::Batch {
+        app.on_task_done(TaskDone::Swept {
             acct_idx: 0,
             client: None,
             password: None,
             kind: Load::More,
-            cursor: 4,
+            // one more from a@, and a sender nobody has seen yet
+            sweep: window(
+                vec![msg(5, "a@x.com", "three"), msg(9, "c@x.com", "hi")],
+                9,
+                2,
+                2,
+            ),
             result: Ok(()),
         });
 
-        let after: Vec<String> = app.accounts[0]
+        let acct = &app.accounts[0];
+        assert_eq!(acct.back, 6, "the window reaches four deeper than before");
+        let counts: Vec<(&str, usize)> = acct
             .stacks
             .iter()
-            .map(|s| s.key.clone())
+            .map(|s| (s.key.as_str(), s.msgs.len()))
             .collect();
-        assert_eq!(after[..before.len()], before[..], "the head is untouched");
-        assert_eq!(after.last().unwrap(), "c@x.com");
-        assert!(app.accounts[0].known_senders.contains("c@x.com"));
+        assert_eq!(
+            counts,
+            [("a@x.com", 3), ("b@x.com", 2), ("c@x.com", 1)],
+            "a@ grew inside its own stack and the list re-sorted"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// omission from a triage list is undetectable, so a refused fan-out shows
-    /// what it managed to read and says the count is short
+    /// Windows overlap when mail arrives between two sweeps, so the same
+    /// message can be read twice. The store is keyed by UID, so a repeat must
+    /// not become a second copy inside the stack.
     #[test]
-    fn a_refused_sender_becomes_a_partial_stack_rather_than_a_gap() {
+    fn a_message_swept_twice_lands_in_the_stack_once() {
+        let path = temp_log("sweep-dupe");
+        let mut app = test_app(ActionLog::at(path.clone()));
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(1, "a@x.com", "one")], 4, 1, 1),
+            result: Ok(()),
+        });
+
+        let a = stack_idx(&app, "a@x.com");
+        assert_eq!(
+            app.accounts[0].stacks[a].msgs.len(),
+            2,
+            "still uids 1 and 2"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a stack's count under-reports only when the server refused a fan-out;
+    /// nothing in the sweep path sets it, and #30 removes the state entirely
+    #[test]
+    fn a_partial_sender_marks_only_its_own_stack() {
         let path = temp_log("partial");
         let mut app = test_app(ActionLog::at(path.clone()));
-        app.on_sender(
-            0,
-            SenderBatch {
-                addr: "c@x.com".into(),
-                msgs: vec![msg(9, "c@x.com", "hi")],
-                partial: true,
-            },
-        );
+        app.accounts[0].partial_senders.insert("b@x.com".into());
+
         let acct = &app.accounts[0];
-        let stack = acct.stacks.last().unwrap();
-        assert!(acct.is_partial(stack));
+        let b = &acct.stacks[stack_idx(&app, "b@x.com")];
+        assert!(acct.is_partial(b));
         assert!(
-            !acct.is_partial(&acct.stacks[0]),
+            !acct.is_partial(&acct.stacks[stack_idx(&app, "a@x.com")]),
             "the others are unaffected"
         );
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Spec: a refused chunk keeps the chunks that landed and reports a short
+    /// window. `back` stops where the sweep did, so `m` retries the remainder
+    /// of that window before advancing (ADR 0003).
     #[test]
-    fn batch_error_clears_busy_and_keeps_what_already_streamed_in() {
-        let path = temp_log("load-err");
+    fn a_short_window_keeps_its_stacks_and_leaves_the_remainder_for_m() {
+        let path = temp_log("sweep-short");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].back = 0;
+        app.accounts[0].reached_end = false;
+        app.busy = true;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(9, "c@x.com", "hi")], 5_000, 5_000, 2_400),
+            result: Err(anyhow::anyhow!("NO [CANNOT] fetch")),
+        });
+
+        assert!(!app.busy);
+        let acct = &app.accounts[0];
+        assert_eq!(acct.back, 2_400, "m picks up where the sweep stopped");
+        assert!(!acct.exhausted(), "there is more mailbox behind the hole");
+        assert_eq!(acct.stacks.len(), 3, "the stacks that landed stay");
+        assert!(
+            app.status.contains("stopped at 2,400 of 5,000"),
+            "status: {}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// a refusal on the very first chunk is still a short window, and the
+    /// count is the thing the user needs told
+    #[test]
+    fn a_window_that_lost_every_chunk_still_reports_how_far_it_got() {
+        let path = temp_log("sweep-none");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].back = 0;
+        app.accounts[0].reached_end = false;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![], 5_000, 5_000, 0),
+            result: Err(anyhow::anyhow!("NO [CANNOT] fetch")),
+        });
+
+        assert_eq!(app.accounts[0].back, 0, "nothing was swept");
+        assert!(
+            app.status.contains("stopped at 0 of 5,000"),
+            "status: {}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `m` grows stacks that are already on screen, so a snapshot taken before
+    /// the widening would log a keep for fewer messages than the user kept
+    #[test]
+    fn a_stack_that_grew_under_a_widened_window_is_re_snapshotted() {
+        let path = temp_log("seen-grew");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        app.record_seen(&[a]);
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(vec![msg(5, "a@x.com", "three")], 9, 1, 1),
+            result: Ok(()),
+        });
+        let a = stack_idx(&app, "a@x.com");
+        app.record_seen(&[a]);
+        app.flush_keeps();
+
+        let recs = read_records(&path);
+        let keep = recs.iter().find(|r| r["sender"] == "a@x.com").unwrap();
+        assert_eq!(keep["action"], "keep");
+        assert_eq!(keep["count"], 3, "the keep counts the widened stack");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_sweep_that_never_started_clears_busy_and_keeps_the_stacks() {
+        let path = temp_log("sweep-err");
         let mut app = test_app(ActionLog::at(path.clone()));
         let before = app.accounts[0].stacks.len();
         app.busy = true;
-        app.on_task_done(TaskDone::Batch {
+        app.on_task_done(TaskDone::Swept {
             acct_idx: 0,
             client: None,
             password: None,
             kind: Load::Reset,
-            cursor: 7,
+            sweep: Box::default(),
             result: Err(anyhow::anyhow!("boom")),
         });
         assert!(!app.busy);
         assert!(app.accounts[0].client.is_none());
         assert_eq!(app.accounts[0].stacks.len(), before);
-        // a failure does not un-scan what discovery already read; dropping the
-        // cursor would make the next `m` spend its whole budget re-reading it
-        assert_eq!(app.accounts[0].cursor, 7);
+        assert_eq!(
+            app.accounts[0].total, 4,
+            "a sweep that never anchored does not blank the mailbox total"
+        );
+        assert!(
+            app.accounts[0].reached_end,
+            "nor does it claim there is more mailbox behind the window"
+        );
+        assert_eq!(app.accounts[0].back, 4, "nor does it move the window");
         assert!(app.status.starts_with("error:"), "status: {}", app.status);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// the cursor is an index, so removing entries behind it would slide it
-    /// forward over senders that were never discovered
+    /// Trashed mail leaves the mailbox, so the window's own reach shrinks with
+    /// it. Without that, the next `m` would start that many messages too deep
+    /// and skip the mail that slid up into the hole.
     #[test]
-    fn pruning_acted_uids_holds_the_cursor_over_the_same_message() {
+    fn trashing_pulls_the_window_back_by_what_left_the_mailbox() {
         let path = temp_log("prune");
         let mut app = test_app(ActionLog::at(path.clone()));
-        app.accounts[0].uids = vec![5, 4, 3, 2, 1];
-        app.accounts[0].cursor = 3; // next unread uid is 2
-        // stack "a@x.com" holds uids 1 and 2 — one behind the cursor, one ahead
+        app.accounts[0].total = 137_482;
+        app.accounts[0].back = 5_000;
+        // "a@x.com" holds two of the swept messages
         let a = stack_idx(&app, "a@x.com");
-        app.prune_uids(&[a]);
+        app.prune_window(&[a]);
 
-        assert_eq!(app.accounts[0].uids, vec![5, 4, 3]);
-        assert_eq!(app.accounts[0].cursor, 3, "uid 3 is still next");
-        assert!(app.accounts[0].exhausted());
+        assert_eq!(app.accounts[0].total, 137_480);
+        assert_eq!(app.accounts[0].back, 4_998);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn m_on_an_exhausted_list_says_so_instead_of_reconnecting() {
+    fn m_at_the_end_of_the_mailbox_says_so_instead_of_reconnecting() {
         let path = temp_log("m-exhausted");
         let mut app = test_app(ActionLog::at(path.clone()));
         app.handle_normal(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(app.task_rx.is_none(), "no load was spawned");
-        assert!(app.status.contains("no more senders"), "{}", app.status);
+        assert!(app.task_rx.is_none(), "no sweep was spawned");
+        assert!(app.status.contains("no more messages"), "{}", app.status);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1495,8 +1600,8 @@ mod tests {
             GroupBy::Sender,
             SortBy::Count,
         );
-        second.uids = vec![9];
-        second.cursor = 1;
+        second.total = 1;
+        second.back = 1;
         second.loaded = true;
         app.accounts.push(second);
         app.status = "me@x.com: 4 of 4 messages in 2 stacks".into();
