@@ -17,7 +17,7 @@ How far back a sweep has reached: the newest 5,000 UIDs, and another 5,000 for e
 _Avoid_: Budget, page, limit
 
 **Fan-out**:
-The search that finds every message one sender has in the mailbox, ignoring the window. It returns UIDs and nothing else, and runs once when the user acts on a stack: its result is the number the confirm prompt states, and then the set the action works on. What makes trashing a stack remove all of that sender's mail rather than the part on screen.
+The search that finds every message one sender has in the mailbox, ignoring the window. It returns UIDs and nothing else, and runs once when the user acts on a stack: its result is the number the confirm prompt states, and then the set the action works on. What makes trashing a stack remove all of that sender's mail rather than the part on screen. Grouping by sender **and subject** has no fan-out: a stack is then one thread of a sender, and `SEARCH` has no key for the normalized subject it was grouped on — so those stacks act on the mail inside the window.
 _Avoid_: Expand, resolve, full search
 
 **Keep**:
