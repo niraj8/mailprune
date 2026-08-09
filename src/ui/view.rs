@@ -185,6 +185,32 @@ fn first_that_fits(candidates: &[String], width: usize) -> String {
         .clone()
 }
 
+/// How the pane title states the window, long form and short, each with the
+/// separator that follows it so an unswept account can drop the segment whole.
+///
+/// `newest 5,000 of 137,482 msgs` while the window is bounded, `all 3,120 msgs`
+/// once the sweep reached the oldest message — the user has to be able to tell
+/// "this is a window" from "this is everything", because it decides whether
+/// they trust the list. `newest` is what stops the count reading as a mailbox
+/// total, so it travels with the number down every rung of the ladder rather
+/// than being the first thing abbreviated away; a bare `5,000/137,482` says
+/// something this pane does not mean. Both numbers fall as mail is trashed.
+fn window_segments(acct: &super::app::AccountView) -> (String, String) {
+    let total = commas(acct.inbox_total());
+    if !acct.loaded {
+        // nothing has been swept, so there is no window to state yet
+        (String::new(), String::new())
+    } else if acct.exhausted() {
+        (format!("all {total} msgs · "), format!("all {total} · "))
+    } else {
+        let reach = commas(acct.window());
+        (
+            format!("newest {reach} of {total} msgs · "),
+            format!("newest {reach}/{total} · "),
+        )
+    }
+}
+
 fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let acct = app.account();
     let visible = app.visible_stacks();
@@ -202,19 +228,13 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // the message total drop first
     let title = if app.filter.is_empty() {
         let n = visible.len();
-        // loaded of mailbox-wide, because the loaded set is a recency window
-        // while every count in it is the sender's true total. Both numbers
-        // fall as you triage: the denominator shrinking is the mailbox
-        // actually getting smaller.
-        let (loaded, total) = (commas(acct.loaded_messages()), commas(acct.inbox_total()));
+        let (window, window_short) = window_segments(acct);
         let (group, sort) = (app.group_by.label(), app.sort_by.label());
         first_that_fits(
             &[
-                format!(
-                    " stacks ({n}) · {loaded} of {total} msgs · by {group} · sort {sort}{marked} "
-                ),
-                format!(" stacks ({n}) · {loaded}/{total} · by {group} · sort {sort}{marked} "),
-                format!(" stacks ({n}) · {loaded}/{total} · {group} · {sort}{marked} "),
+                format!(" stacks ({n}) · {window}by {group} · sort {sort}{marked} "),
+                format!(" stacks ({n}) · {window_short}by {group} · sort {sort}{marked} "),
+                format!(" stacks ({n}) · {window_short}{group} · {sort}{marked} "),
                 format!(" stacks ({n}) · {group} · {sort}{marked} "),
                 format!(" {n} · {group} · {sort}{marked} "),
                 format!(" {n} · {group} · {sort}{marked_short} "),
@@ -1143,24 +1163,84 @@ mod tests {
         assert!(frame.contains("any key to close"));
     }
 
-    /// the loaded set is a recency window, so a title reporting only what is
-    /// loaded says "412" whether the mailbox holds 412 messages or 137,482
-    #[test]
-    fn the_pane_title_reports_the_mailbox_total_not_the_loaded_count() {
+    /// the pane title at `w` columns
+    fn pane_title(app: &mut App, w: u16) -> String {
+        render(app, w, MIN_HEIGHT)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
+    }
+
+    /// an account whose window reaches 5,000 back into a six-figure mailbox
+    fn app_with_a_bounded_window() -> App {
         let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
         app.account_mut().total = 137_482;
         app.account_mut().back = 5_000;
         app.account_mut().reached_end = false;
+        app
+    }
 
-        let title = render(&mut app, 200, MIN_HEIGHT)
-            .lines()
-            .nth(1)
-            .unwrap()
-            .to_string();
+    /// The count on the title is the window, not what happens to be loaded: a
+    /// title reporting only the loaded messages says "1" whether the sweep
+    /// reached 5,000 messages back or the mailbox holds one.
+    #[test]
+    fn the_pane_title_states_the_window_it_swept() {
+        let mut app = app_with_a_bounded_window();
+        let title = pane_title(&mut app, 200);
         assert!(
-            title.contains("1 of 137,482 msgs"),
-            "loaded-of-total lost: {title:?}"
+            title.contains("newest 5,000 of 137,482 msgs"),
+            "the window is not stated: {title:?}"
         );
+    }
+
+    /// "this is a window" and "this is everything" decide whether the list can
+    /// be trusted, so the title has to tell them apart
+    #[test]
+    fn a_sweep_that_reached_the_oldest_message_says_all_rather_than_newest() {
+        let mut app = app_with_a_bounded_window();
+        app.account_mut().total = 3_120;
+        app.account_mut().back = 3_120;
+        app.account_mut().reached_end = true;
+
+        let title = pane_title(&mut app, 200);
+        assert!(title.contains("all 3,120 msgs"), "{title:?}");
+        assert!(!title.contains("newest"), "nothing is behind it: {title:?}");
+    }
+
+    /// `newest` is the word that stops the count reading as a mailbox total, so
+    /// no rung of the ladder may keep the number and drop it.
+    #[test]
+    fn the_window_count_never_outlives_the_word_that_qualifies_it() {
+        let mut app = app_with_a_bounded_window();
+        for w in MIN_WIDTH..=200 {
+            let title = pane_title(&mut app, w);
+            assert!(
+                !title.contains("5,000") || title.contains("newest"),
+                "an unqualified window count at {w} cols: {title:?}"
+            );
+        }
+
+        app.account_mut().reached_end = true;
+        for w in MIN_WIDTH..=200 {
+            let title = pane_title(&mut app, w);
+            assert!(
+                !title.contains("137,482") || title.contains("all"),
+                "an unqualified mailbox count at {w} cols: {title:?}"
+            );
+        }
+    }
+
+    /// an account with nothing swept has no window to state — the alert over
+    /// this pane is saying what is happening
+    #[test]
+    fn a_pane_with_nothing_swept_yet_states_no_window() {
+        let mut app = app_with(vec![], GroupBy::Sender);
+        app.account_mut().loaded = false;
+        let title = pane_title(&mut app, 200);
+        assert!(!title.contains("newest"), "{title:?}");
+        assert!(!title.contains("msgs"), "{title:?}");
+        assert!(title.contains("by sender"), "the rest survives: {title:?}");
     }
 
     #[test]
@@ -1179,6 +1259,23 @@ mod tests {
         let bob = rows.lines().find(|r| r.contains("Bob")).unwrap();
         assert!(alice.contains("~1"), "no short-count marker: {alice:?}");
         assert!(!bob.contains('~'), "the others are unmarked: {bob:?}");
+    }
+
+    /// Both numbers are about mail that is still there, so both fall as it is
+    /// trashed — a window that kept claiming 5,000 after the user emptied it
+    /// would be describing messages that no longer exist.
+    #[test]
+    fn the_window_and_the_mailbox_total_both_fall_as_mail_is_trashed() {
+        let mut app = app_with_a_bounded_window();
+        assert!(pane_title(&mut app, 200).contains("newest 5,000 of 137,482 msgs"));
+
+        app.account_mut().total -= 400;
+        app.account_mut().back -= 400;
+        assert!(
+            pane_title(&mut app, 200).contains("newest 4,600 of 137,082 msgs"),
+            "{:?}",
+            pane_title(&mut app, 200)
+        );
     }
 
     /// clearing the batch and clearing the inbox look identical otherwise, and

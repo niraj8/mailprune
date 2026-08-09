@@ -721,6 +721,30 @@ mod tests {
         assert_eq!(mailbox.ranges.last(), Some(&(10_001, 11_000)));
     }
 
+    /// A refusal on chunk 3 of 5 leaves the window 2,600 short at its oldest
+    /// edge. `m` carries the count the sweep actually reached, so the next
+    /// sweep starts at that edge and fills the hole before it advances —
+    /// skipping it would leave a gap mid-window that nothing in the UI could
+    /// explain (ADR 0003).
+    #[tokio::test]
+    async fn m_after_a_short_window_reads_the_remainder_before_it_advances() {
+        let mut mailbox = FakeMailbox::of_size(20_000)
+            .fetches_answer(&[Answer::Ok, Answer::Ok, Answer::Refuse]);
+        let (short, result, _) = swept(&mut mailbox, 0).await;
+        assert!(result.is_err());
+        assert_eq!(short.swept, 2_000, "the window stopped two chunks in");
+
+        let mut mailbox = FakeMailbox::of_size(20_000);
+        let (_, result, _) = swept(&mut mailbox, short.swept).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            mailbox.ranges[0],
+            (17_001, 18_000),
+            "the retry starts where the refusal stopped, not past the hole"
+        );
+    }
+
     #[tokio::test]
     async fn a_sweep_re_anchors_to_the_top_so_arrivals_do_not_shift_it_off() {
         let mut mailbox = FakeMailbox::of_size(20_000);
