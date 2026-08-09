@@ -258,15 +258,11 @@ fn draw_stack_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let s = &acct.stacks[i];
             let is_marked = acct.marked.contains(&s.key);
             let mark = if is_marked { "▌" } else { " " };
-            // a refused fan-out leaves only the discovery sample, so the count
-            // under-reports and trashing the stack under-clears. The marker is
-            // the warning; it shares the count's width rather than costing a
-            // column of its own.
-            let count = if acct.is_partial(s) {
-                format!("{:>4}", format!("~{}", s.msgs.len()))
-            } else {
-                format!("{:>4}", s.msgs.len())
-            };
+            // What the window holds for this sender, plainly. Nothing is fanned
+            // out until the user acts, so no count here can be short — the
+            // mailbox-wide number arrives at the confirm prompt, and a refused
+            // fan-out is reported against the action that ran (ADR 0002).
+            let count = format!("{:>4}", s.msgs.len());
             let badge = if s.can_unsubscribe { "U" } else { " " };
             let rate = s.read_rate();
             let rate_style = match rate {
@@ -1243,8 +1239,10 @@ mod tests {
         assert!(title.contains("by sender"), "the rest survives: {title:?}");
     }
 
+    /// Nothing is fanned out until the user acts, so no row can be showing a
+    /// short count — `~` described a stack state that no longer exists.
     #[test]
-    fn a_refused_senders_count_is_marked_short_rather_than_read_as_the_truth() {
+    fn no_row_carries_a_short_count_marker() {
         let mut app = app_with(
             vec![
                 msg(1, "a@x.com", "Alice", "hi"),
@@ -1252,13 +1250,9 @@ mod tests {
             ],
             GroupBy::Sender,
         );
-        app.account_mut().partial_senders.insert("a@x.com".into());
-
         let rows = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join("\n");
-        let alice = rows.lines().find(|r| r.contains("Alice")).unwrap();
-        let bob = rows.lines().find(|r| r.contains("Bob")).unwrap();
-        assert!(alice.contains("~1"), "no short-count marker: {alice:?}");
-        assert!(!bob.contains('~'), "the others are unmarked: {bob:?}");
+        assert!(!rows.contains('~'), "{rows:?}");
+        assert!(rows.contains("Alice") && rows.contains("Bob"));
     }
 
     /// Both numbers are about mail that is still there, so both fall as it is
@@ -1430,6 +1424,15 @@ mod tests {
         alert_at(app, 100, 30)
     }
 
+    /// a fan-out that found `total` messages, `in_view` of them on screen
+    fn fanned(total: u32, in_view: usize) -> crate::ui::app::FanOut {
+        crate::ui::app::FanOut {
+            uids: (1..=total).collect(),
+            in_view,
+            refused: Vec::new(),
+        }
+    }
+
     fn sweeping(swept: usize, stacks: usize) -> Alert {
         Alert::Sweeping {
             starting: "connecting to me@x.com…".into(),
@@ -1477,13 +1480,14 @@ mod tests {
             },
             Case {
                 title: "confirm",
-                headline: "trash 1 message from Alice?",
+                headline: "trash 1 message from Alice (1 in view)?",
                 hint: "y yes · n no",
                 set: |app| {
                     app.loading = false;
                     app.alert = None;
                     app.mode = Mode::Confirm(PendingAction::Trash {
                         stack_idxs: vec![0],
+                        fan: fanned(1, 1),
                     });
                 },
             },
@@ -1582,6 +1586,7 @@ mod tests {
                 app.alert = None;
                 app.mode = Mode::Confirm(PendingAction::Trash {
                     stack_idxs: vec![0],
+                    fan: fanned(1, 1),
                 });
             }
             let before = alert(&mut app);
@@ -1755,6 +1760,7 @@ mod tests {
         app.alert = None;
         app.mode = Mode::Confirm(PendingAction::Trash {
             stack_idxs: vec![0],
+            fan: fanned(1, 1),
         });
         assert_eq!(footer(&mut app, 80), "", "nor under a confirm");
     }
@@ -1782,6 +1788,7 @@ mod tests {
         app.alert = None;
         app.mode = Mode::Confirm(PendingAction::Trash {
             stack_idxs: vec![0],
+            fan: fanned(1, 1),
         });
         let row = status_row(&mut app);
         assert!(!row.contains("[y/n]"), "the confirm moved too: {row:?}");

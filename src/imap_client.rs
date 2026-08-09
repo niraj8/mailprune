@@ -201,14 +201,16 @@ impl ImapClient {
 ///
 /// `exists` is the mailbox size, which is also the newest message's sequence
 /// number. `fetch_seq` takes an inclusive sequence range — one command's worth,
-/// the caller chunks — and `fetch` the same by UID. Either can come back with
-/// fewer messages than were asked for, because mail expunged since the count
-/// was taken simply returns nothing. `search` returns UIDs newest-first.
+/// the caller chunks — and can come back with fewer messages than were asked
+/// for, because mail expunged since the count was taken simply returns nothing.
+/// `search` returns UIDs newest-first.
+///
+/// Headers are fetched on one path only, the sweep. Fan-out is the `SEARCH`
+/// alone (ADR 0002), so there is no by-UID fetch here to be tempted by.
 pub trait Mailbox {
     fn exists(&mut self) -> impl Future<Output = Result<u32>>;
     fn fetch_seq(&mut self, lo: u32, hi: u32) -> impl Future<Output = Result<Vec<MsgMeta>>>;
     fn search(&mut self, query: &str) -> impl Future<Output = Result<Vec<u32>>>;
-    fn fetch(&mut self, uids: &[u32]) -> impl Future<Output = Result<Vec<MsgMeta>>>;
 }
 
 impl Mailbox for ImapClient {
@@ -239,16 +241,6 @@ impl Mailbox for ImapClient {
         let query = query.to_string();
         timed(SEARCH_TIMEOUT_SECS, "imap search", async move {
             Ok(newest_first(session.uid_search(query).await?))
-        })
-        .await
-    }
-
-    async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<MsgMeta>> {
-        let session = &mut self.session;
-        let set = uid_set(uids);
-        timed(FETCH_TIMEOUT_SECS, "imap header fetch", async move {
-            let stream = session.uid_fetch(set, HEADER_QUERY).await?;
-            collect_metas(stream, uids.len()).await
         })
         .await
     }
@@ -393,33 +385,23 @@ pub async fn sweep<M: Mailbox>(
     (window, result)
 }
 
-/// Every message from `addr` still in the mailbox, and whether that is all of
-/// them. `FROM` is a substring match server-side, so `a@b.com` also matches
-/// `xa@b.com` — the results are filtered back to the exact address.
+/// Every message `addr` still has in the mailbox, whatever the window reaches —
+/// the number the confirm prompt states, and then the set the action works on.
 ///
-/// A refused chunk stops the walk but keeps the chunks that did arrive: they
-/// are real messages, and falling all the way back to the discovery sample
-/// would under-report further than the failure requires.
-// nothing calls fan-out between the load path going and #30 wiring it to the
-// action path, where it loses its FETCH half and becomes the SEARCH alone
-#[allow(dead_code)]
-async fn fan_out<M: Mailbox>(mailbox: &mut M, addr: &str) -> Result<(Vec<MsgMeta>, bool)> {
+/// The `SEARCH` alone. Stacks come from the sweep now, so nothing here wants
+/// headers, and one round trip answers both questions rather than two (ADR
+/// 0002). It runs when the user acts, never at load.
+///
+/// `FROM` is a substring match server-side, so `a@b.com` also matches
+/// `xa@b.com`, and a display name that quotes an address matches it too.
+/// Narrowing that back to the exact sender is what the deleted FETCH half used
+/// to do; with no headers there is nothing here to compare against, which is
+/// why the count this returns is stated on the confirm prompt before anything
+/// moves — the number the user approves is the number that gets acted on.
+pub async fn fan_out<M: Mailbox>(mailbox: &mut M, addr: &str) -> Result<Vec<u32>> {
     let uids = mailbox.search(&format!("FROM {}", quoted(addr))).await?;
-    let mut msgs = Vec::with_capacity(uids.len());
-    let mut complete = true;
-    for chunk in uids.chunks(FETCH_CHUNK) {
-        match mailbox.fetch(chunk).await {
-            Ok(part) => msgs.extend(part),
-            Err(e) if is_timeout(&e) => return Err(e),
-            Err(e) => {
-                crate::debuglog::write(format!("imap fetch refused for {addr}: {e:#}"));
-                complete = false;
-                break;
-            }
-        }
-    }
-    msgs.retain(|m| m.sender_email.eq_ignore_ascii_case(addr));
-    Ok((msgs, complete))
+    crate::debuglog::write(format!("imap fan-out {addr}: {} uids", uids.len()));
+    Ok(uids)
 }
 
 /// a UID search result as a newest-first list
@@ -661,15 +643,6 @@ mod tests {
             ))
         }
 
-        async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<MsgMeta>> {
-            self.next_fetch_answer()?;
-            Ok(self
-                .msgs
-                .iter()
-                .filter(|m| uids.contains(&m.uid) && !self.silent.contains(&m.uid))
-                .cloned()
-                .collect())
-        }
     }
 
     /// one sweep, with the progress it reported along the way
@@ -872,41 +845,19 @@ mod tests {
         assert_eq!(progress.last().map(|p| p.stacks), Some(1));
     }
 
-    /// Spec: "`FROM` is a substring match, so `a@b.com` also matches
-    /// `xa@b.com` — results are filtered to the exact address." Without the
-    /// filter, trashing one newsletter would take another sender's mail.
+    /// Spec: fan-out is the `SEARCH` alone, returning UIDs. Stacks come from
+    /// the sweep, so the FETCH half has nothing left to build.
     #[tokio::test]
-    async fn a_substring_match_never_lands_in_another_senders_fan_out() {
-        let mut mailbox = FakeMailbox::new(vec![
-            meta(1, "news@x.com"),
-            meta(2, "xnews@x.com"),
-            meta(3, "news@x.com"),
-        ]);
-        let (msgs, complete) = fan_out(&mut mailbox, "news@x.com").await.unwrap();
+    async fn a_fan_out_is_one_search_and_asks_for_no_headers() {
+        let msgs: Vec<MsgMeta> = (1..=1_500).map(|uid| meta(uid, "big@x.com")).collect();
+        let mut mailbox = FakeMailbox::new(msgs);
 
-        assert!(complete);
-        assert_eq!(msgs.len(), 2);
-        assert!(
-            msgs.iter().all(|m| m.sender_email == "news@x.com"),
-            "xnews@ leaked into news@'s fan-out"
-        );
-    }
+        let uids = fan_out(&mut mailbox, "big@x.com").await.unwrap();
 
-    /// A sender with more mail than one FETCH can carry is split across
-    /// commands. If a later chunk is refused, the chunks that did arrive are
-    /// real messages and are worth keeping.
-    #[tokio::test]
-    async fn a_refused_fan_out_chunk_keeps_the_chunks_that_arrived() {
-        let msgs: Vec<MsgMeta> = (1..=(FETCH_CHUNK as u32 + 500))
-            .map(|uid| meta(uid, "big@x.com"))
-            .collect();
-        // 1,500 messages is two fan-out chunks; the second is refused
-        let mut mailbox = FakeMailbox::new(msgs).fetches_answer(&[Answer::Ok, Answer::Refuse]);
-
-        let (msgs, complete) = fan_out(&mut mailbox, "big@x.com").await.unwrap();
-
-        assert!(!complete, "the count is short and must say so");
-        assert_eq!(msgs.len(), FETCH_CHUNK, "the first chunk survives");
+        assert_eq!(uids.len(), 1_500, "every message the sender still has");
+        assert_eq!(uids[0], 1_500, "newest first");
+        assert!(mailbox.searched);
+        assert_eq!(mailbox.fetch_calls, 0, "no header fetch on the action path");
     }
 
     #[tokio::test]
