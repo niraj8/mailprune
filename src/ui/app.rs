@@ -11,6 +11,18 @@ use super::view::commas;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
+/// what still responds while a sweep runs, named on screen for its whole
+/// length — the TUI is inert on everything else (ADR 0001)
+const LIVE_KEYS: &str = "q quits";
+
+/// the two keys that leave, live in every state including a running sweep
+fn is_quit(key: KeyEvent) -> bool {
+    matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+    )
+}
+
 pub enum Mode {
     Normal,
     /// pending action awaiting y/n
@@ -211,17 +223,19 @@ impl AccountView {
     /// list is grouped and sorted once rather than merged chunk by chunk
     /// (ADR 0003). Windows can overlap when mail arrived between two sweeps,
     /// so a message already held wins over the repeat.
+    /// The selection is restored by the caller, which is the only place that
+    /// can see the filter — `selected` is a row in the *visible* list, not an
+    /// index into `stacks`.
     fn absorb(&mut self, msgs: Vec<MsgMeta>, group_by: GroupBy, sort_by: SortBy) {
         let mut all: Vec<MsgMeta> = self.stacks.drain(..).flat_map(|s| s.msgs).collect();
         all.extend(msgs);
         let mut seen = HashSet::new();
         all.retain(|m| seen.insert(m.uid));
         self.stacks = build_stacks(all, group_by, sort_by);
-        self.clamp_selection();
     }
 
-    /// keep the selection on a row that exists. #27 replaces this with
-    /// following the selected stack by key across the completion sort.
+    /// keep the selection on a row that exists, for the paths with no stack to
+    /// follow — a removal takes its row with it
     fn clamp_selection(&mut self) {
         if self.selected >= self.stacks.len() {
             self.selected = self.stacks.len().saturating_sub(1);
@@ -300,7 +314,14 @@ impl App {
 
     /// indices into account().stacks that match the current filter
     pub fn visible_stacks(&self) -> Vec<usize> {
-        let acct = self.account();
+        self.visible_in(self.active)
+    }
+
+    /// the same, for an account that may not be the active one — a sweep
+    /// finishes against the account it was spawned for, whatever `Tab` did
+    /// meanwhile
+    fn visible_in(&self, acct_idx: usize) -> Vec<usize> {
+        let acct = &self.accounts[acct_idx];
         if self.filter.is_empty() {
             return (0..acct.stacks.len()).collect();
         }
@@ -317,6 +338,28 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// key of the stack an account's cursor is on, the one thing about the
+    /// selection that survives a regroup or a re-sort
+    fn selected_key(&self, acct_idx: usize) -> Option<String> {
+        let acct = &self.accounts[acct_idx];
+        let i = *self.visible_in(acct_idx).get(acct.selected)?;
+        Some(acct.stacks[i].key.clone())
+    }
+
+    /// put the cursor back on the stack it was on, wherever the rebuild moved
+    /// it. A key can vanish — every one of its messages was acted on — so the
+    /// row it left behind is the fallback.
+    fn follow_selection(&mut self, acct_idx: usize, was_on: Option<String>) {
+        let visible = self.visible_in(acct_idx);
+        let row = was_on.and_then(|key| {
+            visible
+                .iter()
+                .position(|&i| self.accounts[acct_idx].stacks[i].key == key)
+        });
+        let acct = &mut self.accounts[acct_idx];
+        acct.selected = row.unwrap_or_else(|| acct.selected.min(visible.len().saturating_sub(1)));
     }
 
     /// index into stacks of the currently selected (filtered) row
@@ -470,10 +513,15 @@ impl App {
         self.task_rx = Some(rx);
         self.busy = true;
         self.loading = true;
+        // ADR 0001 requires the UI to say plainly that keys are refused rather
+        // than swallow them in silence. Until #28 gives the alert its hint
+        // line, the status row is the only channel — and it has to be standing
+        // text, because a refusal posted on the keypress would be overwritten
+        // by the next progress tick before it could be read.
         self.status = if existing.is_some() {
-            format!("sweeping {}…", cfg.email)
+            format!("sweeping {}… ({LIVE_KEYS})", cfg.email)
         } else {
-            format!("connecting to {}…", cfg.email)
+            format!("connecting to {}… ({LIVE_KEYS})", cfg.email)
         };
         tokio::spawn(async move {
             // handed back in the Done message so later loads and the
@@ -533,7 +581,7 @@ impl App {
                 // the only feedback a sweep gives: the list itself does not
                 // move until the window is complete (ADR 0003)
                 let _ = tx.send(TaskMsg::Status(format!(
-                    "sweeping {email} — {} of {} · {} stacks",
+                    "sweeping {email} — {} of {} · {} stacks ({LIVE_KEYS})",
                     commas(p.swept),
                     commas(p.bound),
                     p.stacks
@@ -558,6 +606,20 @@ impl App {
     pub fn handle_event(&mut self, ev: Event) {
         let Event::Key(key) = ev else { return };
         if key.kind != crossterm::event::KeyEventKind::Press {
+            return;
+        }
+        // The TUI is inert for a sweep's whole length (ADR 0001). This is
+        // wider than the `busy` gate below: that one only has to keep an
+        // action's stack indices valid, so it still allows scrolling and help.
+        // A sweep refuses those too — on a widen the previous window is still
+        // on screen, and letting the cursor roam a list that is about to be
+        // rebuilt under it is the silent retargeting ADR 0003 rules out.
+        // The refusal is stated in `status` for the whole sweep, not posted
+        // per keypress, so nothing here writes to it.
+        if self.loading {
+            if is_quit(key) {
+                self.should_quit = true;
+            }
             return;
         }
         match self.mode {
@@ -937,6 +999,11 @@ impl App {
                 result,
             } => {
                 let (group_by, sort_by) = (self.group_by, self.sort_by);
+                // The user pressed `m` with a stack in mind, and the
+                // completion sort can move it anywhere. Held as a row index it
+                // would retarget the cursor silently, which matters the moment
+                // the next key is `d` (ADR 0003).
+                let was_on = self.selected_key(acct_idx);
                 let acct = &mut self.accounts[acct_idx];
                 acct.client = client.map(|c| *c);
                 if password.is_some() {
@@ -959,7 +1026,11 @@ impl App {
                         acct.absorb(std::mem::take(&mut sweep.msgs), group_by, sort_by);
                     }
                     if kind == Load::Reset {
-                        acct.selected = 0;
+                        // a reset discards the window, so there is no stack
+                        // left to follow — the cursor goes home
+                        self.accounts[acct_idx].selected = 0;
+                    } else {
+                        self.follow_selection(acct_idx, was_on);
                     }
                 }
                 match result {
@@ -1622,6 +1693,206 @@ mod tests {
         app.handle_normal(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Normal), "no confirm prompt opened");
         assert!(app.status.contains("busy"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn send(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.handle_event(Event::Key(KeyEvent::new(code, mods)));
+    }
+
+    /// ADR 0001: the TUI is inert for the sweep's whole length. Even the keys
+    /// an action leaves live — scrolling, help — are refused: nothing renders
+    /// until the window completes, so there is no list to move under them.
+    #[test]
+    fn every_key_but_quit_is_refused_while_a_sweep_runs() {
+        let path = temp_log("sweep-inert");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].selected = 1;
+        app.busy = true;
+        app.loading = true;
+        // whatever the sweep last posted; the refused keys must not touch it
+        let progress = app.status.clone();
+
+        for code in [
+            KeyCode::Char('k'),
+            KeyCode::Char('j'),
+            KeyCode::Home,
+            KeyCode::Char('?'),
+            KeyCode::Char('g'),
+            KeyCode::Char('s'),
+            KeyCode::Char('/'),
+            KeyCode::Char(' '),
+            KeyCode::Char('d'),
+            KeyCode::Char('m'),
+            KeyCode::Char('R'),
+            KeyCode::Tab,
+        ] {
+            send(&mut app, code, KeyModifiers::NONE);
+        }
+
+        assert!(!app.should_quit);
+        assert_eq!(app.accounts[0].selected, 1, "the cursor did not move");
+        assert!(matches!(app.mode, Mode::Normal), "no mode was entered");
+        assert_eq!(app.group_by, GroupBy::Sender);
+        assert_eq!(app.sort_by, SortBy::Count);
+        assert!(app.account().marked.is_empty());
+        assert!(app.task_rx.is_none(), "no second sweep was spawned");
+        assert_eq!(
+            app.status, progress,
+            "the sweep's own line survives the refused keys"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR 0001: the refusal is said plainly rather than swallowed in silence.
+    /// Until #28 gives the alert a hint line, the status row carries it — and
+    /// it has to stand for the sweep's whole length, because a line posted on
+    /// the keypress would be overwritten by the next progress tick.
+    // `spawn_batch` puts the sweep on the runtime; the task never runs here,
+    // the status it sets on the way out is the whole assertion
+    #[tokio::test]
+    async fn a_running_sweep_names_the_keys_that_still_respond() {
+        let path = temp_log("sweep-hint");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].loaded = false;
+        app.spawn_batch(Load::Reset);
+        assert!(app.loading);
+        assert!(app.status.contains("q quits"), "status: {}", app.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the two keys that stay live: a sweep is read-only, so quitting mid-way
+    /// abandons nothing that needs logging
+    #[test]
+    fn q_and_ctrl_c_still_quit_during_a_sweep() {
+        let path = temp_log("sweep-quit");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.loading = true;
+        send(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.should_quit);
+
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.loading = true;
+        send(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR 0003: selection follows the stack it was on, by key, across the
+    /// completion sort — holding the row index instead retargets the cursor
+    /// silently, which matters the moment the next key is `d`.
+    #[test]
+    fn selection_follows_its_stack_by_key_across_the_completion_sort() {
+        let path = temp_log("sweep-sel");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        let a = stack_idx(&app, "a@x.com");
+        app.accounts[0].selected = a;
+
+        // b@ overtakes a@ on count, so the row a@ sits on is no longer a@'s
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            sweep: window(
+                vec![
+                    msg(6, "b@x.com", "three"),
+                    msg(7, "b@x.com", "four"),
+                    msg(8, "c@x.com", "hi"),
+                ],
+                9,
+                3,
+                3,
+            ),
+            result: Ok(()),
+        });
+
+        let keys: Vec<&str> = app.accounts[0]
+            .stacks
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        assert_eq!(keys, ["b@x.com", "a@x.com", "c@x.com"], "the sort moved a@");
+        assert_eq!(
+            app.accounts[0].selected,
+            stack_idx(&app, "a@x.com"),
+            "the cursor followed a@ rather than holding its row"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `selected` is a row in the *filtered* list, not an index into `stacks`.
+    /// A filter survives `m` — set it, `Esc` back to Normal, widen — so the
+    /// follow has to read and write the selection in that space or it lands on
+    /// whatever stack happens to sit at that absolute index.
+    #[test]
+    fn selection_follows_its_stack_by_key_under_a_filter_too() {
+        let path = temp_log("sweep-sel-filter");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        // "x.com" matches every sender, so the filtered list is the whole list
+        // shifted only by the sort — and row 1 is a@ before the widen
+        app.filter = "b@".into();
+        app.accounts[0].selected = 0;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::More,
+            // c@ outranks both, so b@ moves down the unfiltered list
+            sweep: window(
+                vec![
+                    msg(6, "c@x.com", "one"),
+                    msg(7, "c@x.com", "two"),
+                    msg(8, "c@x.com", "three"),
+                ],
+                7,
+                3,
+                3,
+            ),
+            result: Ok(()),
+        });
+
+        assert_eq!(
+            stack_idx(&app, "b@x.com"),
+            2,
+            "b@ is the last stack overall"
+        );
+        assert_eq!(
+            app.accounts[0].selected, 0,
+            "but still the only filtered row, so the cursor stays on it"
+        );
+        assert_eq!(
+            app.selected_stack_idx(),
+            Some(2),
+            "and resolves to b@, not to whatever sits at row 0"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A reset discards the window and sweeps from the top, so there is no
+    /// stack to follow — the cursor goes home.
+    #[test]
+    fn a_reset_puts_the_selection_back_at_the_top() {
+        let path = temp_log("sweep-sel-reset");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].selected = 1;
+
+        app.on_task_done(TaskDone::Swept {
+            acct_idx: 0,
+            client: None,
+            password: None,
+            kind: Load::Reset,
+            sweep: window(
+                vec![msg(1, "a@x.com", "one"), msg(3, "b@x.com", "one")],
+                2,
+                2,
+                2,
+            ),
+            result: Ok(()),
+        });
+
+        assert_eq!(app.accounts[0].selected, 0);
         let _ = std::fs::remove_file(&path);
     }
 
