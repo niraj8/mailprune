@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_stack_list(frame, app, panes[0]);
     draw_detail(frame, app, panes[1]);
     draw_status(frame, app, outer[2]);
-    draw_help(frame, outer[3]);
+    draw_help(frame, app, outer[3]);
 
     if matches!(app.mode, Mode::Help) {
         draw_help_overlay(frame, frame.area());
@@ -435,6 +435,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if !matches!(app.mode, Mode::Normal) {
         return;
     }
+    // a sweep refuses all four, and the status line names the ones that do
+    // respond — offering them here would be the UI saying two things (ADR 0001)
+    if app.loading {
+        return;
+    }
     // group before sort: it is the coarser control, so it is the one worth
     // keeping when a narrow terminal drops the tail
     let view_keys: &[(&str, &str)] = &[
@@ -486,7 +491,14 @@ fn hint_spans<'a>(hints: &[(&'a str, &'a str)], max: usize) -> Vec<Span<'a>> {
 
 /// keys that change what happens to mail. the ones that only change the
 /// *view* ride along on the status row instead — see `draw_status`.
-fn draw_help(frame: &mut Frame, area: Rect) {
+///
+/// A sweep refuses every one of these, so the row goes blank for its length
+/// rather than offer keys that do nothing (ADR 0001). The status line above
+/// keeps naming the ones that still respond.
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    if app.loading {
+        return;
+    }
     const HINTS: &[(&str, &str)] = &[
         ("j/k", "move"),
         ("Space", "mark"),
@@ -1019,6 +1031,24 @@ mod tests {
         app.loading = true;
         let pane = stack_pane(&mut app, MIN_WIDTH, MIN_HEIGHT).join(" ");
         assert!(pane.contains("loading"), "{pane:?}");
+    }
+
+    /// ADR 0001: a sweep refuses every key but `q` and ctrl-c. Leaving the
+    /// hint rows up would have the UI offering keys it is about to swallow —
+    /// the status line is where the ones that still respond get named.
+    #[test]
+    fn a_running_sweep_takes_down_the_hints_for_the_keys_it_refuses() {
+        let mut app = app_with(vec![msg(1, "a@x.com", "Alice", "hi")], GroupBy::Sender);
+        assert!(footer(&mut app, 80).contains("trash"));
+        assert!(status_row(&mut app).contains("m more"));
+
+        app.loading = true;
+        assert_eq!(footer(&mut app, 80), "", "no action keys during a sweep");
+        assert!(
+            !status_row(&mut app).contains("m more"),
+            "nor the view keys: {}",
+            status_row(&mut app)
+        );
     }
 
     #[test]
