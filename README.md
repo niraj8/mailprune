@@ -119,3 +119,8 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
   future "suggest stacks to act on" features. Disable with `action_log = false`
   in config.toml. Network activity is logged to `debug.log` alongside it;
   disable with `MAILPRUNE_NO_DEBUG_LOG=1`.
+
+## Release
+
+`make release VERSION=X.Y.Z` bumps, tests, tags and pushes; the tag builds the
+tarballs. Then `make publish-tap` hashes them into the Homebrew formula.
