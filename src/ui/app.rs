@@ -241,6 +241,15 @@ impl AccountView {
         self.total
     }
 
+    /// How far back the window reaches, in messages — the number the title
+    /// states as `newest 5,000`. Not `loaded_messages()`: trashed mail leaves
+    /// dead UIDs that a sweep reads and gets nothing for, so the window is
+    /// always the wider of the two, and it is the window the user is deciding
+    /// whether to trust.
+    pub fn window(&self) -> usize {
+        self.back
+    }
+
     /// the window reaches the oldest message — there is nothing left to sweep
     pub fn exhausted(&self) -> bool {
         self.reached_end
@@ -1620,6 +1629,31 @@ mod tests {
 
         assert_eq!(app.accounts[0].total, 137_480);
         assert_eq!(app.accounts[0].back, 4_998);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A socket that died mid-sweep leaves a window whose size nobody can know,
+    /// so `R` does not widen or repair — it throws the window away and sweeps a
+    /// fresh one from the top, inert like any other sweep (ADR 0002).
+    #[tokio::test]
+    async fn r_discards_the_window_and_sweeps_it_again_from_the_top() {
+        let path = temp_log("r-resweep");
+        let mut app = test_app(ActionLog::at(path.clone()));
+        app.accounts[0].marked.insert("a@x.com".into());
+        app.accounts[0].selected = 1;
+
+        press(&mut app, KeyCode::Char('R'));
+
+        let acct = &app.accounts[0];
+        assert!(acct.stacks.is_empty(), "the window was discarded");
+        assert_eq!(acct.back, 0, "and the next sweep starts at the top");
+        assert_eq!(acct.total, 0);
+        assert!(!acct.reached_end, "nothing is known about the mailbox yet");
+        assert!(!acct.loaded);
+        assert_eq!(acct.selected, 0);
+        assert!(acct.marked.is_empty());
+        assert!(app.loading, "and it is an inert-TUI event like any other sweep");
+        assert!(matches!(app.alert, Some(Alert::Sweeping { .. })));
         let _ = std::fs::remove_file(&path);
     }
 
