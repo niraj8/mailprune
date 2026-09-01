@@ -28,39 +28,16 @@ you@gmail.com: 5,000 of 137,482 messages in 42 stacks   m more  g group  s sort
  j/k move  Space mark  d trash  e archive  r read  u unsub  / filter  ? keys
 ```
 
-## The window, and what a stack acts on
+## Good to know
 
-mailprune sweeps the **newest 5,000 messages** in your inbox and stacks those.
-That is the window. Give the pane the width and its title says so —
-`newest 5,000 of 137,482 msgs`, or `all 3,120 msgs` once a sweep has reached the
-oldest message in the mailbox. (The 80-column screenshot above is too narrow for
-it: the title spends what it has on the group and sort state instead.) `m`
-sweeps the next 5,000 and folds them into the stacks already on screen; `R`
-reconnects and re-sweeps from scratch.
+- Trash and archive act on a sender **mailbox-wide**, not just the messages
+  currently on screen — the confirm prompt always tells you the real count.
+- **Nothing is ever deleted permanently.** `d` moves mail to Gmail Trash, which
+  Gmail keeps for 30 days. That's the undo story.
+- `m` pulls in more mail when a pane runs dry; `R` reconnects and starts over.
 
-The number on a row is that sender's mail **inside the window**. Trashing and
-archiving are not limited to the window: `d` and `e` search your whole inbox
-for that sender and act on everything they find. So the confirm prompt asks
-about a bigger number than the row shows —
-
-```
-trash 1,204 messages from DoorDash (214 in view)?
-```
-
-— and 1,204 is the one that moves. Confirm on that. If the server refuses the
-search, the action still runs but reaches only the mail in view, and the status
-line says so.
-
-Two exceptions. Under `g` (sender+subject) a row is one kind of mail from a
-sender rather than the sender, and IMAP cannot search on that subject, so `d`
-and `e` act on the window's mail only — the prompt's two numbers agree because
-they are the same number. And `r` (mark read) always stays on the window's
-mail: it moves nothing out of the mailbox, so it asks nothing.
-
-`u` unsubscribes per sender; the "also trash?" prompt after it states a
-mailbox-wide count like any other trash.
-
-The internals are in `docs/adr/0001`–`0004`.
+Curious how the sync window or unsubscribe flow actually works? See
+`docs/adr/0001`–`0004`.
 
 ## Install
 
@@ -108,19 +85,10 @@ No keyring daemon? Use the `MAILPRUNE_PASSWORD_<EMAIL_WITH_UNDERSCORES>` env var
 
 ## Notes
 
-- **Nothing is ever deleted permanently.** `d` moves mail to Gmail Trash, which
-  Gmail keeps for 30 days. That's the undo story.
 - The read-rate % is the share of a stack's messages you've opened, red when
   ≈0. A 0% stack with 100 messages is a newsletter you should unsubscribe from.
-- `u` tries RFC 8058 one-click POST first, then `mailto:` (sends a real email
-  via SMTP from your account), then opens the `https` link in your browser.
-- mailprune writes a local log of your triage decisions — header metadata only,
-  never message bodies — to `~/.local/state/mailprune/actions.jsonl`, for
-  future "suggest stacks to act on" features. Disable with `action_log = false`
-  in config.toml. Network activity is logged to `debug.log` alongside it;
-  disable with `MAILPRUNE_NO_DEBUG_LOG=1`.
-
-## Release
-
-`make release VERSION=X.Y.Z` bumps, tests, tags and pushes; the tag builds the
-tarballs. Then `make publish-tap` hashes them into the Homebrew formula.
+- `u` tries RFC 8058 one-click unsubscribe first, then falls back to `mailto:`
+  or opening the link in your browser.
+- Triage decisions are logged locally (headers only, never message bodies) to
+  `~/.local/state/mailprune/actions.jsonl`. Disable with `action_log = false`
+  in config.toml.
