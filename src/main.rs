@@ -56,9 +56,12 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some("stacks") => return cli_stacks().await,
+        Some("export") => {
+            return cli_export(args.get(2).map(String::as_str) == Some("--all")).await;
+        }
         Some("help") | Some("--help") | Some("-h") => {
             println!(
-                "mailprune — email triage TUI\n\n  mailprune            run the TUI\n  mailprune auth <em>  store a Gmail app password in the keychain\n  mailprune stacks     print stacks to stdout (no TUI)\n\nconfig: ~/.config/mailprune/config.toml\n{}",
+                "mailprune — email triage TUI\n\n  mailprune            run the TUI\n  mailprune auth <em>  store a Gmail app password in the keychain\n  mailprune stacks     print stacks to stdout (no TUI)\n  mailprune export     print one JSON object per message to stdout (no TUI)\n                       --all sweeps the whole mailbox, not just the newest window\n\nconfig: ~/.config/mailprune/config.toml\n{}",
                 config::SAMPLE_CONFIG
             );
             return Ok(());
@@ -196,6 +199,91 @@ fn apply(app: &mut ui::app::App, msg: ui::app::TaskMsg) -> bool {
 }
 
 /// headless checkpoint: connect, sweep one window, print stacks
+/// One message as JSON. Headers only — no bodies are ever fetched, let alone
+/// printed. Flat by design: the consumer is `jq` and whatever reads the corpus
+/// next, not this binary.
+#[derive(serde::Serialize)]
+struct ExportedMsg<'a> {
+    account: &'a str,
+    uid: u32,
+    sender: &'a str,
+    sender_name: &'a str,
+    subject: &'a str,
+    date: Option<String>,
+    unread: bool,
+    /// the sender offers a `List-Unsubscribe` header on this message
+    has_unsub: bool,
+    one_click: bool,
+}
+
+/// Print the mailbox as JSONL, one object per message, for every configured
+/// account. Progress and failures go to stderr so stdout stays a clean stream.
+///
+/// `all` keeps sweeping past the first window until the mailbox runs out;
+/// without it this prints the newest window only, like the TUI's first view.
+async fn cli_export(all: bool) -> Result<()> {
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let cfg = config::load()?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for account in &cfg.accounts {
+        eprintln!("== {} ({}) ==", account.name, account.email);
+        let password = config::get_password(&account.email)?;
+        let mut client = imap_client::ImapClient::connect(account, &password).await?;
+
+        // windows overlap when mail arrives mid-export, so the corpus dedupes
+        // by UID the way the TUI's store does
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut back = 0usize;
+        let mut written = 0usize;
+        loop {
+            let (sweep, outcome) = imap_client::sweep(&mut client, back, |p| {
+                eprintln!("  swept {} of {}", p.swept, p.bound);
+            })
+            .await;
+            // a short window is still a window: print what landed, then say
+            // what stopped it
+            if let Err(e) = outcome {
+                eprintln!("  sweep stopped: {e:#}");
+            }
+            for m in &sweep.msgs {
+                if !seen.insert(m.uid) {
+                    continue;
+                }
+                let row = ExportedMsg {
+                    account: &account.email,
+                    uid: m.uid,
+                    sender: &m.sender_email,
+                    sender_name: &m.sender_name,
+                    subject: &m.subject,
+                    date: m.date.map(|d| d.to_rfc3339()),
+                    unread: m.unread,
+                    has_unsub: m.list_unsubscribe.is_some(),
+                    one_click: m.one_click,
+                };
+                writeln!(out, "{}", serde_json::to_string(&row)?)?;
+                written += 1;
+            }
+            back += sweep.swept;
+            // stop at the first window unless asked for the lot; a sweep that
+            // read nothing would otherwise loop forever
+            if !all || sweep.reached_end || sweep.swept == 0 {
+                eprintln!(
+                    "  exported {written} of {} messages in the mailbox",
+                    sweep.total
+                );
+                break;
+            }
+        }
+        client.logout().await;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 async fn cli_stacks() -> Result<()> {
     let cfg = config::load()?;
     for account in &cfg.accounts {
